@@ -96,12 +96,25 @@ def test_an_empty_conversation_produces_an_empty_tail():
     assert safe_tail([], 1000) == []
 
 
-def test_a_tail_made_entirely_of_tool_chatter_falls_back_to_the_last_message():
+def test_a_tail_made_entirely_of_tool_chatter_keeps_the_pair_rather_than_an_orphan():
+    """Раньше здесь бралось последнее сообщение, и им оказывался результат без обращения.
+
+    Такой запрос поставщик отвергает целиком — 22.09.2026 на этом вставал разговор, стоило
+    агенту снять экран. Пара дороже бюджета: слишком длинный запрос модель обработает,
+    пустой — нет.
+    """
     messages = [_calls_tool(), _tool_result(), _calls_tool(), _tool_result("второй")]
 
     tail = safe_tail(messages, 10)
 
-    assert len(tail) == 1 and tail[0]["content"] == "второй"
+    assert tail and not _is_orphan_start(tail)
+    assert tail[-1]["content"] == "второй"
+
+
+def _is_orphan_start(tail: list[dict]) -> bool:
+    """Начинается ли хвост с результата инструмента, у которого нет своего обращения."""
+    first = tail[0]
+    return first.get("role") == "tool" or first.get("tool_call_id") is not None
 
 
 # -- слои ----------------------------------------------------------------------------------
@@ -434,3 +447,20 @@ def test_the_budget_follows_the_window_of_the_model():
     assert total_budget_for(2_000_000) == 300_000
     assert total_budget_for(200_000) == 90_000                       # не ниже пола
     assert total_budget_for(0) == TOTAL_BUDGET and total_budget_for(None) == TOTAL_BUDGET
+
+
+def test_a_huge_result_of_the_current_turn_never_leaves_an_orphaned_tail():
+    """Снимок экрана больше всего бюджета не должен оставить хвост из одного результата.
+
+    Результат без своего обращения поставщик отвергает целиком, и запрос уходит пустым —
+    разговор встаёт. Лучше превысить бюджет, чем отправить то, что не примут.
+    """
+    huge = _tool_result("x" * (MIN_TAIL_BUDGET * 3))
+    messages = [_user("сними экран"), _calls_tool("computer_use"), huge]
+
+    tail = safe_tail(messages, MIN_TAIL_BUDGET)
+
+    assert tail, "хвост не может быть пустым"
+    assert is_clean_boundary(tail, 0), "хвост начинается не с чистой границы"
+    assert tail[0]["role"] == "user"
+    assert tail[-1] is huge, "свежий результат обязан остаться в запросе"
