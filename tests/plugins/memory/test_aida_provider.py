@@ -7,6 +7,7 @@ import pytest
 
 import plugins.memory.aida as aida
 from plugins.memory.aida import AidaMemoryProvider, _Store
+from plugins.memory.aida import recall_signal
 
 
 class _FakeStore:
@@ -50,6 +51,17 @@ class _RecordingStore(_FakeStore):
         return 1
 
 
+@pytest.fixture(autouse=True)
+def _a_clean_recall_signal():
+    """Флаг «контекстный движок ищет сам» живёт на весь процесс.
+
+    Стоит одному файлу тестов поднять движок — и память в следующем файле молча
+    перестаёт искать под ход: поиск делает якобы движок, которого в том тесте нет.
+    Сброс для этого и написан; без него порядок файлов решает, что упадёт.
+    """
+    recall_signal.reset()
+    yield
+    recall_signal.reset()
 def _memory(id_: int = 1, content: str = "Переезд в декабре") -> dict:
     return {"id": id_, "content": content, "memory_type": "fact", "priority": "P2", "created_at": None}
 
