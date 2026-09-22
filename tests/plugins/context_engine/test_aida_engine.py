@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 import plugins.context_engine.aida as engine_module
 from plugins.context_engine.aida import AidaContextEngine
+from plugins.memory.aida import recall_signal
 
 
 class _Store:
@@ -33,6 +36,17 @@ class _Store:
         self.closed = True
 
 
+@pytest.fixture(autouse=True)
+def _a_clean_recall_signal():
+    """Флаг «контекстный движок ищет сам» живёт на весь процесс.
+
+    Стоит одному файлу тестов поднять движок — и память в следующем файле молча
+    перестаёт искать под ход: поиск делает якобы движок, которого в том тесте нет.
+    Сброс для этого и написан; без него порядок файлов решает, что упадёт.
+    """
+    recall_signal.reset()
+    yield
+    recall_signal.reset()
 def _engine(store) -> AidaContextEngine:
     eng = AidaContextEngine()
     eng._store = store
