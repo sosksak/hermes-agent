@@ -49,6 +49,20 @@ class _Store:
         self.embedded.append(row_id)
         return True
 
+    # вытеснение
+    neighbours: dict[int, list[dict]] = {}
+    contents: dict[int, str] = {}
+
+    def similar_to(self, row_id, min_sim, limit=5):
+        return list(self.neighbours.get(row_id, []))[:limit]
+
+    def content_of(self, row_id):
+        return self.contents.get(row_id, "")
+
+    def archive_ids(self, ids):
+        self.archived = getattr(self, "archived", []) + list(ids)
+        return len(ids)
+
     def close(self):
         pass
 
@@ -273,7 +287,7 @@ def test_an_exchange_the_model_could_not_answer_waits_for_the_next_night(tmp_pat
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
 
-    assert nightly_job.distill(store, queue) == 0
+    assert nightly_job.distill(store, queue)[0] == 0
     assert queue.count_exchanges() == 1
     assert "модель не ответила" in capsys.readouterr().out
     queue.close()
@@ -285,7 +299,7 @@ def test_a_short_exchange_is_not_worth_a_model_call(tmp_path, monkeypatch):
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "ок", "ага")
 
-    assert nightly_job.distill(store, queue) == 0
+    assert nightly_job.distill(store, queue)[0] == 0
     assert queue.count_exchanges() == 0  # короткий обмен отпущен, а не копится вечно
     queue.close()
 
@@ -299,7 +313,7 @@ def test_an_exchange_that_was_distilled_is_not_distilled_again(tmp_path, monkeyp
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
 
-    assert nightly_job.distill(store, queue) == 1
+    assert nightly_job.distill(store, queue)[0] == 1
     assert store.saved[0]["content"] == "Переезд в декабре"
     assert store.saved[0]["priority"] == "P1"
     assert queue.count_exchanges() == 0
@@ -319,6 +333,70 @@ def test_a_fact_found_at_night_is_left_for_the_batch_that_fills_in_meaning_searc
 
     assert store.saved[0]["embed"] is False
     queue.close()
+
+
+# -- вытеснение устаревшего -----------------------------------------------------------------
+
+
+def _store_with_neighbours():
+    store = _Store()
+    store.contents = {10: "Приложение развёрнуто в версии 9.9.3"}
+    store.neighbours = {10: [
+        {"id": 3, "content": "Приложение развёрнуто в версии 9.6.1"},
+        {"id": 7, "content": "Второй ближайший склад — Пушкино-2"},
+    ]}
+    return store
+
+
+def test_a_newer_fact_sends_the_old_version_of_itself_to_the_archive(monkeypatch):
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: "[3]")
+    store = _store_with_neighbours()
+
+    assert nightly_job.supersede(store, [10]) == 1
+    assert store.archived == [3]
+
+
+def test_the_model_cannot_archive_what_it_was_not_shown(monkeypatch):
+    # Модель назвала чужой id и сам новый факт — ни то, ни другое не трогаем.
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: "[3, 10, 999]")
+    store = _store_with_neighbours()
+
+    nightly_job.supersede(store, [10])
+    assert store.archived == [3]
+
+
+def test_only_older_memories_can_be_superseded(monkeypatch):
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: "[42]")
+    store = _Store()
+    store.contents = {10: "новое"}
+    store.neighbours = {10: [{"id": 42, "content": "ещё новее"}]}
+
+    assert nightly_job.supersede(store, [10]) == 0
+
+
+def test_a_silent_model_leaves_the_memory_untouched(monkeypatch):
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: None)
+    store = _store_with_neighbours()
+
+    assert nightly_job.supersede(store, [10]) == 0
+    assert not getattr(store, "archived", [])
+
+
+def test_a_fact_with_no_close_neighbours_costs_no_model_call(monkeypatch):
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: pytest.fail("не должно вызываться"))
+    store = _Store()
+    store.contents = {10: "одинокий факт"}
+
+    assert nightly_job.supersede(store, [10]) == 0
+
+
+@pytest.mark.parametrize("raw", ["", "не список", "[true, \"3\"]", "{}"])
+def test_garbage_from_the_model_is_read_as_nothing_to_archive(raw):
+    assert nightly_job.parse_ids(raw) == []
+
+
+def test_ids_are_dug_out_of_prose_and_fences():
+    assert nightly_job.parse_ids("Вот ответ:\n```json\n[3, 7]\n```") == [3, 7]
 
 
 # -- дозаполнение поиска --------------------------------------------------------------------

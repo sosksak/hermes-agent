@@ -12,6 +12,11 @@
 3. **Дозаполняет поиск.** У записи без вектора нет смыслового поиска: её находит только
    совпадение слов. На 21 сентября 2026 таких было 463 из 525 — это и есть давняя жалоба
    «память есть, а поиск не работает».
+4. **Вытесняет устаревшее.** Для каждого факта, записанного этой ночью, ищет старые записи
+   с близким смыслом и спрашивает модель, какие из них он заменил. Так «версия 9.6.1» уходит
+   в архив, когда приходит «версия 9.9.3», а «цель месяца — 100 тысяч», сказанная десять раз,
+   остаётся одной строкой. Судит модель, а не вектор: по близости «Пушкино-1» и «Пушкино-2»
+   неотличимы от повтора (замер 13.10.2026: 0.86 при пороге повторов ~0.89).
 
 Запускается без модели-агента: `hermes cron` зовёт его как обычный скрипт, и всё, что он
 печатает, попадает в отчёт целиком.
@@ -40,6 +45,11 @@ MAX_TURNS_PER_RUN = 600
 MAX_EXCHANGES_PER_RUN = 80
 MAX_EMBEDDINGS_PER_RUN = 200
 EMBED_BATCH = 8
+# Вытеснение: сколько свежих фактов проверить за ночь, насколько близкий сосед — кандидат,
+# и сколько соседей показать модели. Ниже 0.7 по замеру лежат соседи по теме, а не по сути.
+MAX_SUPERSEDE_PER_RUN = 60
+SUPERSEDE_MIN_SIM = 0.7
+SUPERSEDE_NEIGHBOURS = 5
 
 # Короче этого — «ок», «ага», «поправляй». Порог взят у бота: он измерен на его переписке.
 MIN_EXCHANGE_LENGTH = 12
@@ -95,6 +105,18 @@ priority:
 
 Пиши content самодостаточно: он будет прочитан без диалога вокруг.
 Если извлекать нечего — верни []."""
+
+SUPERSEDE_PROMPT = """Ты следишь за порядком в долговременной памяти ассистента.
+
+Дана НОВАЯ запись и несколько СТАРЫХ, близких по смыслу. Определи, какие старые записи новая делает лишними:
+- старая говорит то же самое другими словами (повтор);
+- старая сообщает прежнее состояние того же самого (версия, адрес, статус, цифра), а новая — более позднее.
+
+НЕ считай лишней старую запись, если она про другой объект, другую дату или содержит детали, которых в новой нет.
+
+Пример. НОВАЯ: «Приложение версии 9.9 развёрнуто на сайте». СТАРЫЕ: [1] «Приложение версии 9.6 развёрнуто на сайте», [2] «Версия 9.3 развёрнута с новой вкладкой X». Ответ: [1] — та же запись с прежним номером; [2] остаётся, потому что несёт факт о вкладке X.
+
+Верни ТОЛЬКО JSON-массив id старых записей, которые стоит убрать, например [12, 15]. Если убирать нечего — []."""
 
 
 def load_profile_env(hermes_home: Path) -> None:
@@ -270,13 +292,16 @@ def _model_targets() -> list[dict]:
     return targets
 
 
-def distill(store, queue, limit: int = MAX_EXCHANGES_PER_RUN) -> int:
+def distill(store, queue, limit: int = MAX_EXCHANGES_PER_RUN) -> tuple[int, list[int]]:
     """Разобрать ждущие обмены и положить найденное в общую базу.
+
+    Возвращает счёт и id записанного: их потом проверяет вытеснение.
 
     Обмен покидает очередь, только когда модель на него ответила. Не ответила — он ждёт
     следующей ночи: реплики к тому времени уже в базе, и разобрать их иначе было бы нечем.
     """
     written = 0
+    written_ids: list[int] = []
     unanswered = 0
     for exchange in queue.pending_exchanges(limit=limit):
         question, answer = exchange["question"], exchange["answer"]
@@ -291,15 +316,17 @@ def distill(store, queue, limit: int = MAX_EXCHANGES_PER_RUN) -> int:
             unanswered += 1
             continue
         for fact in parse_facts(content):
-            if store.save(fact["content"], memory_type=fact["type"], priority=fact["priority"],
-                          role="system", chat_id=source_tag("nightly"), embed=False):
+            ids = store.save(fact["content"], memory_type=fact["type"], priority=fact["priority"],
+                             role="system", chat_id=source_tag("nightly"), embed=False)
+            if ids:
                 written += 1
+                written_ids.extend(int(i) for i in ids)
         queue.release_exchanges([exchange["id"]])
     if unanswered:
         # Молчаливый ноль здесь читался бы как «в разговоре не было ничего важного»,
         # а это совсем другая новость.
         print(f"  разбор: модель не ответила на {unanswered} обменов — они разберутся в следующий раз")
-    return written
+    return written, written_ids
 
 
 # ─── 3. Дозаполнить поиск ─────────────────────────────────────────────────────
@@ -320,6 +347,55 @@ def backfill_embeddings(store, limit: int = MAX_EMBEDDINGS_PER_RUN) -> tuple[int
             if vector and store.set_embedding(int(row_id), vector):
                 filled += 1
     return filled, store.count_without_embedding()
+
+
+# ─── 4. Вытеснить устаревшее ──────────────────────────────────────────────────
+
+
+def parse_ids(raw: str) -> list[int]:
+    """Список чисел из ответа модели; всё, что не список чисел, — пустой ответ."""
+    if not raw:
+        return []
+    text = re.sub(r"```json|```", "", str(raw)).strip()
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [int(item) for item in parsed if isinstance(item, (int, float)) and not isinstance(item, bool)]
+
+
+def supersede(store, new_ids: Iterable[int], limit: int = MAX_SUPERSEDE_PER_RUN) -> int:
+    """Убрать в архив старые записи, которые свежие факты сделали лишними. Возвращает счёт.
+
+    Идёт после дозаполнения векторов: соседей ищет вектор, а у факта, записанного этой же
+    ночью, он появляется только там. Факт без вектора остаётся на следующую ночь — ничего не
+    теряется, просто повтор проживёт на день дольше.
+    """
+    retired = 0
+    for new_id in list(new_ids)[:limit]:
+        neighbours = [n for n in store.similar_to(new_id, SUPERSEDE_MIN_SIM, SUPERSEDE_NEIGHBOURS)
+                      if n["id"] < new_id]  # новое вытесняет старое, не наоборот
+        if not neighbours:
+            continue
+        fresh = store.content_of(new_id)
+        if not fresh:
+            continue
+        listing = "\n".join(f"[{n['id']}] {n['content']}" for n in neighbours)
+        answer = ask_model([
+            {"role": "system", "content": SUPERSEDE_PROMPT},
+            {"role": "user", "content": f"НОВАЯ:\n{fresh}\n\nСТАРЫЕ:\n{listing}"},
+        ])
+        if not answer:
+            continue  # молчание модели — не повод трогать память
+        allowed = {n["id"] for n in neighbours}
+        to_retire = [i for i in parse_ids(answer) if i in allowed]
+        retired += store.archive_ids(to_retire)
+    return retired
 
 
 # ─── Прогон ───────────────────────────────────────────────────────────────────
@@ -343,13 +419,15 @@ def run(hermes_home: Path) -> int:
         shipped, turns = ship_turns(store, queue)
         for session_id, question, answer in build_exchanges(turns):
             queue.enqueue_exchange(session_id, question, answer)
-        facts = distill(store, queue)
+        facts, fact_ids = distill(store, queue)
         filled, left = backfill_embeddings(store)
+        retired = supersede(store, fact_ids)
 
         print("Ночная работа общей памяти")
         print(f"  разговор: довезено {shipped} реплик из {waiting}, ждут ещё {queue.count()}")
         print(f"  суть: записано фактов — {facts}, ждут разбора {queue.count_exchanges()} обменов")
         print(f"  поиск по смыслу: дозаполнено {filled}, осталось без него {left}")
+        print(f"  порядок: убрано устаревших записей — {retired}")
         if not store.alive():
             print("  база в эту ночь была недоступна — всё, что не доехало, ждёт в очереди")
     finally:

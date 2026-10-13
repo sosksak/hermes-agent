@@ -73,11 +73,12 @@ def strip_wrappers(text: str) -> str:
     """Реплика без служебных обёрток шлюза — то, что человек на самом деле написал."""
     return " ".join(_WRAPPER_RE.sub(" ", text or "").split())
 
+# Всё знание P1 целиком: отбор по важности и свежести делает build_knowledge_block, потому что
+# «последние 60 по дате» теряли старые решения, а резались на бюджете посреди строки.
 P1_SQL = """
 SELECT content, memory_type FROM memories
 WHERE status = 'active' AND priority = 'P1' AND memory_type <> 'dialogue'
 ORDER BY created_at DESC
-LIMIT 60
 """
 
 

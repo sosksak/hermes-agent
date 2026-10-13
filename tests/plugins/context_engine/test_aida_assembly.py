@@ -145,7 +145,29 @@ def test_nothing_known_means_no_block_at_all():
 def test_the_knowledge_block_stays_inside_its_budget():
     rows = [{"content": "я" * 500, "memory_type": "fact"} for _ in range(100)]
 
-    assert len(build_knowledge_block(rows, budget=2000)) <= 2010
+    assert len(build_knowledge_block(rows, budget=2000)) <= 2000
+
+
+def test_the_knowledge_block_never_cuts_a_line_in_half():
+    rows = [{"content": f"запись номер {i} " + "х" * 80, "memory_type": "fact"} for i in range(100)]
+
+    block = build_knowledge_block(rows, budget=1500)
+
+    for line in block.splitlines():
+        if line.startswith("- "):
+            assert line.endswith("х" * 80)
+    assert "[…]" not in block
+
+
+def test_a_crowded_group_does_not_push_a_rare_one_out_of_the_knowledge_block():
+    rows = [{"content": f"проект {i} " + "п" * 60, "memory_type": "project"} for i in range(200)]
+    rows.append({"content": "Единственное правило работы", "memory_type": "rule"})
+
+    block = build_knowledge_block(rows, budget=2000)
+
+    assert "Единственное правило работы" in block
+    assert "проект 0 " in block  # свежие (первые в выдаче) берутся раньше старых
+    assert "проект 199 " not in block
 
 
 def test_old_conversation_arrives_as_a_quotation_not_a_retelling():

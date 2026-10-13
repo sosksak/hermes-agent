@@ -51,6 +51,19 @@ WHERE content = %(content)s AND status = 'active' AND chat_id LIKE %(source)s
 RETURNING id
 """
 
+# Memories whose meaning is close to a given one. Used by the nightly merge: a fact restated
+# a dozen times across days ("goal of the month is 100k") becomes one row, not twelve.
+SIMILAR_SQL = """
+SELECT m.id, m.content, m.memory_type, m.priority, m.created_at
+FROM memories m, memories src
+WHERE src.id = %(id)s AND m.id <> src.id
+  AND m.status = 'active' AND m.embedding IS NOT NULL AND src.embedding IS NOT NULL
+  AND m.memory_type <> 'dialogue'
+  AND 1 - (m.embedding <=> src.embedding) >= %(min_sim)s
+ORDER BY m.embedding <=> src.embedding
+LIMIT %(limit)s
+"""
+
 # What the shared store accepts. The live table has no CHECK constraint left on this column
 # (measured 2026-09-21), so the discipline is here or nowhere.
 MEMORY_TYPES = (
