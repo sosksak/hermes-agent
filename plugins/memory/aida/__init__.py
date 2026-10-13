@@ -36,6 +36,7 @@ from .search import (
     format_block,
     row_to_memory,
     to_vector_literal,
+    worth_searching,
 )
 from .write import (
     ARCHIVE_SQL,
@@ -419,6 +420,11 @@ class AidaMemoryProvider(MemoryProvider):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Recall in the background after a turn; :meth:`prefetch` hands it over on the next."""
         if self._store is None:
+            return
+        if not worth_searching(query):
+            # «?», «на», «😂» — искать нечего, а поиск вернул бы кашу из таких же обрывков.
+            with self._lock:
+                self._pending, self._pending_count = "", 0
             return
         if recall_signal.engine_is_assembling():
             # The context engine assembles the window from this same store, and it does so
