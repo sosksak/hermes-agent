@@ -5,12 +5,19 @@ from datetime import datetime
 from plugins.memory.aida.search import (
     BLOCK_BUDGET,
     ENTRY_BUDGET,
+    FTS_SQL,
     MATCH_FLOOR,
+    MIN_DIALOGUE_LENGTH,
     RRF_K,
+    VECTOR_MIN_SIM,
+    VECTOR_SQL,
     combine_rrf,
+    content_words,
     format_block,
     row_to_memory,
     to_vector_literal,
+    worth_quoting,
+    worth_searching,
 )
 
 
@@ -117,3 +124,34 @@ def test_match_floor_stays_in_step_with_the_bot():
     # Drifting apart here makes one side silent about a memory the other happily returns.
     assert MATCH_FLOOR == 0.8
     assert RRF_K == 60
+
+
+# -- что вообще стоит искать --------------------------------------------------------------
+
+
+def test_a_reply_without_a_content_word_is_not_worth_a_search():
+    # Замер 13.10.2026: на «?» поиск отдавал «Да», «на», «все», «что еще?» — и модель
+    # отвечала на эту кашу, а не на реплику. Такие строки не ищем вовсе.
+    for noise in ("?", "😂😂😂", "Да", "на", "все", "именно", "ок, давай", "вот", "  "):
+        assert not worth_searching(noise), noise
+
+
+def test_a_reply_with_a_content_word_is_searched():
+    for real in ("переезд", "надо чинить движок памяти", "сам проверь", "Ангелина извинилась"):
+        assert worth_searching(real), real
+
+
+def test_vector_half_drops_noise_and_one_word_chat_lines():
+    # Случайные пары на этой базе — 0.15 близости, настоящие попадания — от 0.6; порог между.
+    assert 0.3 < VECTOR_MIN_SIM < 0.6
+    assert f">= {VECTOR_MIN_SIM}" in VECTOR_SQL
+    # Реплика «Да» из прошлого месяца не цитируется ни по словам, ни по смыслу.
+    assert f"char_length(m.content) >= {MIN_DIALOGUE_LENGTH}" in VECTOR_SQL
+    assert f"char_length(m.content) >= {MIN_DIALOGUE_LENGTH}" in FTS_SQL
+
+
+def test_quotes_from_old_talk_need_a_real_question_not_a_command():
+    assert not worth_quoting("сам проверь")
+    assert not worth_quoting("найди сам и сделай ресерч") or len(content_words("найди сам и сделай ресерч")) >= 3
+    assert worth_quoting("что мы решили про цель месяца в трекере")
+    assert worth_searching("сам проверь")

@@ -84,7 +84,7 @@ def test_an_old_line_of_conversation_comes_back_as_itself_not_as_a_summary():
         {"content": "я переезжаю в декабре", "memory_type": "dialogue", "role": "user", "created_at": None},
     ])
 
-    selected = _engine(store).select_context(_request())
+    selected = _engine(store).select_context(_request("когда переезд в декабре"))
 
     assert "Оператор: я переезжаю в декабре" in str(selected[-1]["content"])
 
@@ -327,3 +327,66 @@ def test_the_window_of_the_model_sets_the_budget():
     eng.select_context(_request(), budget_tokens=200_000)
 
     assert eng.total_budget == 90_000
+
+
+# -- на что не стоит искать ----------------------------------------------------------------
+
+
+def test_a_bare_question_mark_raises_nothing_from_memory():
+    # 13.10.2026: на «?» витрина подняла «что еще?», «Да», «на», «все» — и модель ответила
+    # на кашу из обрывков, а не на реплику. Искать по такому нечего.
+    store = _Store(found=[{"content": "Да", "memory_type": "dialogue", "created_at": None}])
+
+    selected = _engine(store).select_context(_request("?"), incoming_message={"role": "user", "content": "?"})
+
+    assert store.recall_calls == 0
+    assert "Да" not in str(selected[-1]["content"])
+    assert selected[-1]["content"] == "?"
+    assert recall_signal.last_count() == 0
+
+
+def test_the_search_sees_the_reply_not_the_quoted_message_around_it():
+    # Шлюз оборачивает ответ на сообщение в «[Replying to: "…"]». Искать надо по тому, что
+    # написал человек, а не по длинной цитате — иначе «ваще кайфую» ищется как мой монолог.
+    store = _Store(found=[])
+    wrapped = '[Replying to: "длинный монолог про память и переезд"]  ваще кайфую'
+    seen = []
+    store.recall = lambda query, limit=8: seen.append(query) or []
+
+    _engine(store).select_context(_request(wrapped), incoming_message={"role": "user", "content": wrapped})
+
+    assert seen == ["ваще кайфую"]
+
+
+def test_old_history_survives_the_second_request_of_the_same_turn():
+    # Внутри хода запрос уходит несколько раз; раньше повторный получал только факты.
+    store = _Store(found=[
+        {"content": "факт", "memory_type": "fact", "created_at": None},
+        {"content": "давняя реплика про переезд, длинная", "memory_type": "dialogue", "role": "user", "created_at": None},
+    ])
+    engine = _engine(store)
+    question = "что мы решили про переезд в декабре"
+    msg = {"role": "user", "content": question}
+
+    first = engine.select_context(_request(question), incoming_message=msg)
+    second = engine.select_context(_request(question), incoming_message=msg)
+
+    assert store.recall_calls == 1
+    assert "давняя реплика" in str(first[-1]["content"])
+    assert first[-1]["content"] == second[-1]["content"]
+
+
+def test_a_two_word_command_gets_facts_but_no_quotes_from_old_talk():
+    # «Сам проверь» — команда про то, что на экране, а не вопрос о прошлом. По слову
+    # «провер» полнотекст находил 13 старых монологов, и они ехали в запрос как цитаты.
+    store = _Store(found=[
+        {"content": "правило про проверку", "memory_type": "rule", "created_at": None},
+        {"content": "Мой дорогой друг, вот что удалось найти! Поезда Аткарск → Москва", "memory_type": "dialogue",
+         "role": "assistant", "created_at": None},
+    ])
+
+    selected = _engine(store).select_context(_request("сам проверь"), incoming_message={"role": "user", "content": "сам проверь"})
+
+    text = str(selected[-1]["content"])
+    assert "правило про проверку" in text
+    assert "Аткарск" not in text

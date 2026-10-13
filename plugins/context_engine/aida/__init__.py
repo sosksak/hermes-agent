@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -58,6 +59,20 @@ RECALL_LIMIT = 8
 OLD_HISTORY_LIMIT = 5
 MAX_TRACKED_CONVERSATIONS = 64
 
+# Обёртки шлюза вокруг реплики — не часть вопроса. «[Replying to: "…длинная цитата…"]» перед
+# «ваще кайфую» делает вопросом цитату, а не реплику; «[Image attached at: C:\…]» ищет по
+# пути к файлу. Снимаем, прежде чем искать.
+_WRAPPER_RE = re.compile(
+    r"\[Replying to: \".*?\"\]"
+    r"|\[(?:Replied-to image|Image attached|Gateway message origin)[^\]]*\]",
+    re.DOTALL,
+)
+
+
+def strip_wrappers(text: str) -> str:
+    """Реплика без служебных обёрток шлюза — то, что человек на самом деле написал."""
+    return " ".join(_WRAPPER_RE.sub(" ", text or "").split())
+
 P1_SQL = """
 SELECT content, memory_type FROM memories
 WHERE status = 'active' AND priority = 'P1' AND memory_type <> 'dialogue'
@@ -76,6 +91,26 @@ class _NoSignal:
     @staticmethod
     def publish(count: int) -> None:
         pass
+
+
+def _worth_searching(question: str) -> bool:
+    """Та же проверка, что у памяти: нет памяти — нет и плагина, тогда считаем сами."""
+    try:
+        from plugins.memory.aida.search import worth_searching
+
+        return worth_searching(question)
+    except Exception:
+        return len(question) >= 12
+
+
+def _worth_quoting(question: str) -> bool:
+    """Цитаты давнего разговора — только под настоящий вопрос, не под команду из двух слов."""
+    try:
+        from plugins.memory.aida.search import worth_quoting
+
+        return worth_quoting(question)
+    except Exception:
+        return len(question.split()) >= 3
 
 
 def _load_recall_signal():
@@ -108,7 +143,7 @@ class AidaContextEngine(ContextEngine):
         self.total_budget = TOTAL_BUDGET
         self._lock = threading.Lock()
         self._knowledge: tuple[float, str] = (0.0, "")
-        self._dynamic: tuple[float, str, str] = (0.0, "", "")  # время, ключ, блок
+        self._dynamic: tuple[float, str, tuple[str, str]] = (0.0, "", ("", ""))  # время, ключ, (факты, цитаты)
         self._store: Any = None
         self._store_tried = False
         self._recall_signal = _load_recall_signal()
@@ -253,15 +288,22 @@ class AidaContextEngine(ContextEngine):
         question = (question or "").strip()
         if not question:
             return "", ""
+        question = strip_wrappers(question)
+        if not _worth_searching(question):
+            # «?», «на», «😂😂😂»: искать нечего. Поиск по такому всегда что-то возвращает —
+            # такие же обрывки, — и модель отвечала на них вместо реплики человека.
+            self._recall_signal.publish(0)
+            return "", ""
         key = question[:400]
         with self._lock:
             stamped, cached_key, cached = self._dynamic
             if cached_key == key and time.monotonic() - stamped < DYNAMIC_TTL:
-                return cached, ""
+                return cached
 
         found = store.recall(question, RECALL_LIMIT + OLD_HISTORY_LIMIT)
         facts = [row for row in found if row.get("memory_type") != "dialogue"][:RECALL_LIMIT]
-        talk = [row for row in found if row.get("memory_type") == "dialogue"][:OLD_HISTORY_LIMIT]
+        talk = ([row for row in found if row.get("memory_type") == "dialogue"][:OLD_HISTORY_LIMIT]
+                if _worth_quoting(question) else [])
         recalled = build_recalled_block(facts, RECALLED_BUDGET)
         old_history = build_old_history_block(talk, OLD_HISTORY_BUDGET)
         # Оператор договорился, что подъём памяти всегда видно. Ищет теперь движок, но
@@ -269,7 +311,9 @@ class AidaContextEngine(ContextEngine):
         self._recall_signal.publish(len(facts) + len(talk))
 
         with self._lock:
-            self._dynamic = (time.monotonic(), key, "\n\n".join(b for b in (recalled, old_history) if b))
+            # Кэшируем оба блока как есть: внутри хода запрос уходит несколько раз, и раньше
+            # повторный запрос получал только факты — цитаты давнего разговора терялись.
+            self._dynamic = (time.monotonic(), key, (recalled, old_history))
         return recalled, old_history
 
     def _get_store(self) -> Any:

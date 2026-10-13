@@ -32,12 +32,38 @@ COMMON_WORD_SHARE = 0.1
 MATCH_FLOOR = 0.8
 RRF_K = 60
 
+# Ниже этой косинусной близости вектор — шум. Замер 13.10.2026 на этой базе (1409 векторов,
+# nemotron-embed): случайные пары дают в среднем 0.15; «надо чинить движок памяти» лучшее
+# совпадение 0.39 и всё — не в тему; настоящие попадания («Ангелина извинилась» → её же
+# событие) — 0.60–0.77. Без порога вектор отдавал топ-26 ВСЕГДА, и на «?» в запрос уезжали
+# «Да», «на», «все» — модель отвечала на эту кашу вместо вопроса.
+VECTOR_MIN_SIM = 0.45
+
+# Реплика без содержательного слова — «ок», «на», «все», «?», «именно», «😂😂😂»: её незачем
+# ни искать, ни находить. Искать — потому что в ней нечего матчить (to_tsvector('?') пуст, а
+# вектор у такой строки близок к любой другой такой же). Находить — потому что цитата «Да» из
+# прошлого месяца ничего не говорит и только путает модель. Содержательное слово — от четырёх
+# букв и не из списка слов-заполнителей, которыми оператор отвечает «понял/продолжай».
+MIN_CONTENT_WORD = 4
+FILLER_WORDS = frozenset("""
+именно сейчас давай делай ладно понял точно норм спасибо привет пока ещё еще тоже также
+окей хорошо ясно понятно конечно вообще ваще короче просто почему зачем когда опять снова
+потом здесь тут там этот этого этом вот все всё они оно она ты вы мы они меня тебя себя
+даже надо нужно можно могу можешь будет была было были есть стал стало сразу тогда
+""".split())
+MIN_DIALOGUE_LENGTH = 40
+
 # How much recalled memory may occupy the turn. A stored entry can be 2000 characters long
 # and eight of them would crowd out the conversation actually happening.
 ENTRY_BUDGET = 400
 BLOCK_BUDGET = 2600
 
 COLUMNS = "m.id, m.content, m.memory_type, m.priority, m.created_at"
+
+# Вопрос из нескольких значимых слов должен совпасть хотя бы по двум. Одно редкое слово
+# («чинить») весит много, и запись, где оно встретилось случайно, становилась единственным и
+# потому лучшим совпадением — отсечка от лучшего её не трогала.
+MIN_MATCHED_LEXEMES = 2
 
 # quote_literal() around each lexeme: a question can carry quotes, URLs or emoji, and an
 # unquoted lexeme would either break the tsquery parse or quietly mean something else.
@@ -63,17 +89,20 @@ weighted AS (
     AND seen.df::numeric / (SELECT total FROM corpus) <= {COMMON_WORD_SHARE}
 ),
 scored AS (
-  SELECT {COLUMNS}, sum(weighted.weight) AS rank
+  SELECT {COLUMNS}, sum(weighted.weight) AS rank, count(*) AS matched
   FROM memories m
   JOIN weighted ON m.{SEARCH_COLUMN} @@ quote_literal(weighted.lex)::tsquery
   WHERE m.status = 'active'
+    AND (m.memory_type <> 'dialogue' OR char_length(m.content) >= {MIN_DIALOGUE_LENGTH})
   GROUP BY m.id
 ),
-best AS (SELECT max(rank) AS top FROM scored)
-SELECT scored.*
-FROM scored, best
+best AS (SELECT max(rank) AS top FROM scored),
+asked AS (SELECT count(*) AS lexemes FROM weighted)
+SELECT scored.id, scored.content, scored.memory_type, scored.priority, scored.created_at, scored.rank
+FROM scored, best, asked
 WHERE scored.rank >= {MATCH_FLOOR} * best.top
-ORDER BY scored.rank DESC
+  AND scored.matched >= LEAST({MIN_MATCHED_LEXEMES}, asked.lexemes)
+ORDER BY scored.rank DESC, scored.created_at DESC
 LIMIT %(limit)s
 """
 
@@ -81,9 +110,41 @@ VECTOR_SQL = f"""
 SELECT {COLUMNS}, 1 - (m.embedding <=> %(vec)s::vector) AS rank
 FROM memories m
 WHERE m.status = 'active' AND m.embedding IS NOT NULL
+  AND 1 - (m.embedding <=> %(vec)s::vector) >= {VECTOR_MIN_SIM}
+  AND (m.memory_type <> 'dialogue' OR char_length(m.content) >= {MIN_DIALOGUE_LENGTH})
 ORDER BY m.embedding <=> %(vec)s::vector
 LIMIT %(limit)s
 """
+
+
+# Цитаты давнего разговора поднимаются только под настоящий вопрос. «Сам проверь» и «найди
+# сам» — команды про то, что на экране сейчас; по одному слову «провер» полнотекст находил
+# тринадцать моих старых монологов, и они ехали в запрос как «давний разговор по смыслу».
+MIN_WORDS_FOR_QUOTES = 2
+
+
+def content_words(question: str) -> list[str]:
+    """Слова реплики, по которым есть что искать: от четырёх букв и не заполнители."""
+    words = []
+    for raw in (question or "").split():
+        word = "".join(ch for ch in raw if ch.isalnum()).lower()
+        if len(word) >= MIN_CONTENT_WORD and word not in FILLER_WORDS:
+            words.append(word)
+    return words
+
+
+def worth_searching(question: str) -> bool:
+    """Есть ли в реплике что искать: «?», «на», «😂😂😂», «Да», «именно» — нет; «переезд» — да.
+
+    Такой вопрос не несёт смысла, по которому можно найти прошлое, а поиск по нему всегда
+    что-то возвращает — и это «что-то» уезжает модели вместо вопроса.
+    """
+    return bool(content_words(question))
+
+
+def worth_quoting(question: str) -> bool:
+    """Стоит ли под эту реплику поднимать дословные куски давнего разговора."""
+    return len(content_words(question)) >= MIN_WORDS_FOR_QUOTES
 
 
 def to_vector_literal(vec: Sequence[float]) -> str:
