@@ -229,19 +229,49 @@ def _clip(text: str, budget: int) -> str:
 
 
 def build_knowledge_block(rows: Iterable[dict], budget: int = KNOWLEDGE_BUDGET) -> str:
-    """То, что верно всегда: знание с приоритетом P1, сгруппированное по типам."""
+    """То, что верно всегда: знание с приоритетом P1, сгруппированное по типам.
+
+    Записей больше, чем влезает (на 13.10.2026 — 481 на 67 000 знаков), поэтому отбор, а не
+    обрезка: строки берутся по кругу из каждой группы в порядке прихода (свежие первыми), пока
+    есть бюджет. Так редкая группа — правила, решения, контакты — не вытесняется толпой
+    проектных заметок, а обрезанных на полуслове строк нет вовсе.
+    """
     grouped: dict[str, list[str]] = {}
     for row in rows:
         label = GROUP_LABELS.get(row.get("memory_type") or "", "ПРОЧЕЕ")
-        grouped.setdefault(label, []).append(" ".join(str(row.get("content", "")).split()))
+        item = " ".join(str(row.get("content", "")).split())
+        if item:
+            grouped.setdefault(label, []).append(item)
     if not grouped:
         return ""
+    order = [label for label in GROUP_LABELS.values() if label in grouped]
+    order += [label for label in grouped if label not in order]
+    chosen: dict[str, list[str]] = {label: [] for label in order}
+    spent = sum(len(f"\n\n## {label}") for label in order) + len("# Что я знаю всегда")
+    cursors = {label: 0 for label in order}
+    progressed = True
+    while progressed:
+        progressed = False
+        for label in order:
+            items = grouped[label]
+            index = cursors[label]
+            if index >= len(items):
+                continue
+            line = f"\n- {items[index]}"
+            cursors[label] = index + 1
+            progressed = True
+            if spent + len(line) > budget:
+                continue  # эта не влезла; следующая в группе может быть короче
+            chosen[label].append(items[index])
+            spent += len(line)
     lines = ["# Что я знаю всегда"]
-    for label, items in grouped.items():
+    for label in order:
+        if not chosen[label]:
+            continue
         lines.append("")
         lines.append(f"## {label}")
-        lines.extend(f"- {item}" for item in items)
-    return _clip("\n".join(lines), budget)
+        lines.extend(f"- {item}" for item in chosen[label])
+    return "\n".join(lines)
 
 
 def build_recalled_block(rows: Iterable[dict], budget: int = RECALLED_BUDGET) -> str:

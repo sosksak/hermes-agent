@@ -40,6 +40,7 @@ from .search import (
 )
 from .write import (
     ARCHIVE_SQL,
+    SIMILAR_SQL,
     DUPLICATE_SQL,
     EMBED_SQL,
     INSERT_SQL,
@@ -343,6 +344,26 @@ class _Store:
         if not content:
             return 0
         rows = self._execute_guarded(ARCHIVE_SQL, {"content": content, "source": SOURCE_PREFIX + "%"})
+        return len(rows)
+
+    def similar_to(self, row_id: int, min_sim: float, limit: int = 5) -> list[dict]:
+        """Active non-dialogue memories whose meaning is at least ``min_sim`` close to this one."""
+        rows = self._execute_guarded(SIMILAR_SQL, {"id": row_id, "min_sim": min_sim, "limit": limit})
+        return [{"id": int(r[0]), "content": r[1], "memory_type": r[2], "priority": r[3], "created_at": r[4]}
+                for r in rows]
+
+    def content_of(self, row_id: int) -> str:
+        rows = self._execute_guarded("SELECT content FROM memories WHERE id = %(id)s", {"id": int(row_id)})
+        return str(rows[0][0]) if rows else ""
+
+    def archive_ids(self, ids: list[int]) -> int:
+        """Archive memories by id — used by the nightly pass that merges duplicates."""
+        if not ids:
+            return 0
+        rows = self._execute_guarded(
+            "UPDATE memories SET status = 'archived' WHERE id = ANY(%(ids)s) AND status = 'active' RETURNING id",
+            {"ids": [int(i) for i in ids]},
+        )
         return len(rows)
 
 
