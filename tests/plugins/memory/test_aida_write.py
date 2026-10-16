@@ -179,3 +179,10 @@ def test_the_oldest_turns_are_carried_over_first(tmp_path):
 
     assert [row["content"] for row in queue.pending(limit=3)] == ["реплика 0", "реплика 1", "реплика 2"]
     queue.close()
+
+
+def test_the_nightly_merge_only_ever_touches_this_agent_s_own_rows():
+    from plugins.memory.aida.write import SIMILAR_SQL
+
+    # Таблица общая с ботом: его повторы — его факты, наш судья их не видит.
+    assert "m.chat_id LIKE 'hermes:%%'" in SIMILAR_SQL

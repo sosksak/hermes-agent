@@ -376,8 +376,9 @@ class _Store:
         rows = self._execute_guarded(
             "SELECT id FROM memories WHERE status = 'active' AND priority = 'P1'"
             " AND memory_type NOT IN ('dialogue', 'event') AND embedding IS NOT NULL"
+            " AND chat_id LIKE %(source)s"
             " ORDER BY created_at DESC LIMIT %(limit)s",
-            {"limit": int(limit)},
+            {"limit": int(limit), "source": SOURCE_PREFIX + "%"},
         )
         return [int(r[0]) for r in rows]
 
@@ -389,11 +390,14 @@ class _Store:
         return [row_to_memory(r) for r in rows]
 
     def archive_wrapped_dialogue(self) -> int:
-        """Убрать в архив строки разговора, начинающиеся с «[» — обёртки и доставки, не речь."""
+        """Убрать в архив строки разговора, начинающиеся с «[» — обёртки и доставки, не речь.
+
+        Только строки этого агента: таблица общая, и чужие записи — не наше дело.
+        """
         rows = self._execute_guarded(
             "UPDATE memories SET status = 'archived' WHERE status = 'active' AND memory_type = 'dialogue'"
-            " AND left(ltrim(content), 1) = '[' RETURNING id",
-            {},
+            " AND left(ltrim(content), 1) = '[' AND chat_id LIKE %(source)s RETURNING id",
+            {"source": SOURCE_PREFIX + "%"},
         )
         return len(rows)
 

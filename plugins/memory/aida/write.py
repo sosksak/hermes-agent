@@ -53,12 +53,14 @@ RETURNING id
 
 # Memories whose meaning is close to a given one. Used by the nightly merge: a fact restated
 # a dozen times across days ("goal of the month is 100k") becomes one row, not twelve.
+# Only this agent's own rows are candidates: another writer's duplicate is their fact, not ours.
 SIMILAR_SQL = """
 SELECT m.id, m.content, m.memory_type, m.priority, m.created_at
 FROM memories m, memories src
 WHERE src.id = %(id)s AND m.id <> src.id
   AND m.status = 'active' AND m.embedding IS NOT NULL AND src.embedding IS NOT NULL
   AND m.memory_type <> 'dialogue'
+  AND m.chat_id LIKE 'hermes:%%'
   AND 1 - (m.embedding <=> src.embedding) >= %(min_sim)s
 ORDER BY m.embedding <=> src.embedding
 LIMIT %(limit)s
