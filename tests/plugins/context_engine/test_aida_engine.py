@@ -466,3 +466,15 @@ def test_a_store_without_lessons_still_works():
     selected = _engine(store).select_context(_request(question), incoming_message={"role": "user", "content": question})
 
     assert "переезд в декабре" in str(selected[-1]["content"])
+
+
+def test_a_one_word_command_gets_two_facts_not_eight():
+    found = [{"id": i, "content": f"проверено {i}", "memory_type": "fact", "created_at": None} for i in range(8)]
+    store = _Store(found=found)
+
+    short = _engine(store).select_context(_request("сам проверь"), incoming_message={"role": "user", "content": "сам проверь"})
+    real = _engine(_Store(found=found)).select_context(_request("проверь сборку вкладки"),
+                                                        incoming_message={"role": "user", "content": "проверь сборку вкладки"})
+
+    assert str(short[-1]["content"]).count("- [fact]") == 2
+    assert str(real[-1]["content"]).count("- [fact]") == 8

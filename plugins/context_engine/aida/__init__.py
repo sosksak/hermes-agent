@@ -63,6 +63,10 @@ KNOWLEDGE_TTL = 600.0
 
 RECALL_LIMIT = 8
 OLD_HISTORY_LIMIT = 5
+# Однословная команда («сам проверь», «обнови») не ранжирует: у всех совпадений по одному слову
+# одинаковый вес, и полнотекст отдаёт просто самые свежие. Восемь таких строк — шум под видом
+# памяти; две свежие — максимум, что такой реплике можно доверить.
+SINGLE_WORD_RECALL_LIMIT = 2
 MAX_TRACKED_CONVERSATIONS = 64
 
 # Обёртки шлюза вокруг реплики — не часть вопроса. «[Replying to: "…длинная цитата…"]» перед
@@ -344,12 +348,13 @@ class AidaContextEngine(ContextEngine):
                 return cached
 
         found = store.recall(question, RECALL_LIMIT + OLD_HISTORY_LIMIT)
+        fact_limit = RECALL_LIMIT if _worth_quoting(question) else SINGLE_WORD_RECALL_LIMIT
         activities = _detect_activities(question)
         lesson_rows = (store.lessons_for(activities, LESSONS_LIMIT)
                        if activities and hasattr(store, "lessons_for") else [])
         lesson_ids = {row.get("id") for row in lesson_rows}
         facts = [row for row in found
-                 if row.get("memory_type") != "dialogue" and row.get("id") not in lesson_ids][:RECALL_LIMIT]
+                 if row.get("memory_type") != "dialogue" and row.get("id") not in lesson_ids][:fact_limit]
         talk = (select_quotes([row for row in found if row.get("memory_type") == "dialogue"][:OLD_HISTORY_LIMIT],
                               question=question)
                 if _worth_quoting(question) else [])
