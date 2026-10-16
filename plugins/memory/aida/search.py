@@ -38,6 +38,11 @@ RRF_K = 60
 # событие) — 0.60–0.77. Без порога вектор отдавал топ-26 ВСЕГДА, и на «?» в запрос уезжали
 # «Да», «на», «все» — модель отвечала на эту кашу вместо вопроса.
 VECTOR_MIN_SIM = 0.45
+# У диалога порог выше, чем у фактов. Факт — одна мысль, и близость 0.5 к ней значит «про то же».
+# Строка разговора — это абзац про всё сразу, и 0.5 к нему набирает любой длинный вопрос; на
+# «станешь ли ты цифровой личностью» так поднимались три монолога про переписку с девушкой.
+# Калибровка из aida-memory-engine: настоящие попадания по диалогу лежат от 0.6.
+DIALOGUE_MIN_SIM = 0.6
 
 # Реплика без содержательного слова — «ок», «на», «все», «?», «именно», «😂😂😂»: её незачем
 # ни искать, ни находить. Искать — потому что в ней нечего матчить (to_tsvector('?') пуст, а
@@ -52,13 +57,31 @@ FILLER_WORDS = frozenset("""
 даже надо нужно можно могу можешь будет была было были есть стал стало сразу тогда
 """.split())
 MIN_DIALOGUE_LENGTH = 40
+# Цитата давнего разговора — это слова, сказанные человеку или человеком, а не документ.
+# Монолог ассистента длиннее этого — мой же старый отчёт: если в нём было важное, оно должно
+# было стать правилом или решением, а не всплывать абзацем. Строка, начинающаяся с «[», —
+# обёртка шлюза ([Replying to:, [Image attached), доставка субагента ([ASYNC DELEGATION) или
+# кусок длинной вставки ([часть N/M]): роль у неё человеческая, но говорит в ней не человек.
+QUOTE_MAX_ASSISTANT_CHARS = 600
+# Один эпизод — одна цитата. Вопрос, ответ и пересказ скриншота того же дня из того же разговора
+# — три взгляда на одно, и втроём они занимали весь блок.
+MAX_QUOTES = 2
 
 # How much recalled memory may occupy the turn. A stored entry can be 2000 characters long
 # and eight of them would crowd out the conversation actually happening.
 ENTRY_BUDGET = 400
 BLOCK_BUDGET = 2600
 
-COLUMNS = "m.id, m.content, m.memory_type, m.priority, m.created_at"
+COLUMNS = "m.id, m.content, m.memory_type, m.priority, m.created_at, m.role, m.chat_id"
+
+# Что из разговора вообще можно цитировать. Стоит в обоих запросах, чтобы такие строки не
+# занимали места в выдаче: иначе первые N мест забирают монологи, а короткая реплика человека
+# в N+1 отрезается лимитом и до фильтра в Python не доезжает.
+QUOTABLE_SQL = f"""(m.memory_type <> 'dialogue' OR (
+      char_length(m.content) >= {MIN_DIALOGUE_LENGTH}
+      AND left(ltrim(m.content), 1) <> '['
+      AND NOT (m.role = 'assistant' AND char_length(m.content) > {QUOTE_MAX_ASSISTANT_CHARS})
+  ))"""
 
 # Вопрос из нескольких значимых слов должен совпасть хотя бы по двум. Одно редкое слово
 # («чинить») весит много, и запись, где оно встретилось случайно, становилась единственным и
@@ -93,15 +116,18 @@ scored AS (
   FROM memories m
   JOIN weighted ON m.{SEARCH_COLUMN} @@ quote_literal(weighted.lex)::tsquery
   WHERE m.status = 'active'
-    AND (m.memory_type <> 'dialogue' OR char_length(m.content) >= {MIN_DIALOGUE_LENGTH})
+    AND {QUOTABLE_SQL}
   GROUP BY m.id
 ),
 best AS (SELECT max(rank) AS top FROM scored),
 asked AS (SELECT count(*) AS lexemes FROM weighted)
-SELECT scored.id, scored.content, scored.memory_type, scored.priority, scored.created_at, scored.rank
+SELECT scored.id, scored.content, scored.memory_type, scored.priority, scored.created_at,
+       scored.role, scored.chat_id, scored.rank
 FROM scored, best, asked
 WHERE scored.rank >= {MATCH_FLOOR} * best.top
   AND scored.matched >= LEAST({MIN_MATCHED_LEXEMES}, asked.lexemes)
+  -- диалогу одного совпавшего слова мало всегда, даже если в вопросе оно одно
+  AND (scored.memory_type <> 'dialogue' OR scored.matched >= {MIN_MATCHED_LEXEMES})
 ORDER BY scored.rank DESC, scored.created_at DESC
 LIMIT %(limit)s
 """
@@ -111,7 +137,8 @@ SELECT {COLUMNS}, 1 - (m.embedding <=> %(vec)s::vector) AS rank
 FROM memories m
 WHERE m.status = 'active' AND m.embedding IS NOT NULL
   AND 1 - (m.embedding <=> %(vec)s::vector) >= {VECTOR_MIN_SIM}
-  AND (m.memory_type <> 'dialogue' OR char_length(m.content) >= {MIN_DIALOGUE_LENGTH})
+  AND (m.memory_type <> 'dialogue' OR 1 - (m.embedding <=> %(vec)s::vector) >= {DIALOGUE_MIN_SIM})
+  AND {QUOTABLE_SQL}
 ORDER BY m.embedding <=> %(vec)s::vector
 LIMIT %(limit)s
 """
@@ -153,14 +180,102 @@ def to_vector_literal(vec: Sequence[float]) -> str:
 
 
 def row_to_memory(row: Sequence[Any]) -> dict[str, Any]:
-    """One result row → the shape the rest of the plugin passes around."""
-    return {
+    """One result row → the shape the rest of the plugin passes around.
+
+    ``rank`` is the half's own score (cosine similarity or summed word weight) when the query
+    selected one; it is kept for the recall log, never compared across halves.
+    """
+    memory = {
         "id": row[0],
         "content": row[1],
         "memory_type": row[2],
         "priority": row[3],
         "created_at": row[4],
+        "role": row[5] if len(row) > 5 else None,
+        "chat_id": row[6] if len(row) > 6 else None,
     }
+    if len(row) > 7 and row[7] is not None:
+        memory["rank"] = float(row[7])
+    return memory
+
+
+def is_system_payload(content: str) -> bool:
+    """A dialogue line that starts with «[» is a wrapper or a delivery, not a person speaking."""
+    return (content or "").lstrip().startswith("[")
+
+
+def quotable(row: dict) -> bool:
+    """Может ли эта строка разговора ехать в «Из давнего разговора» (см. QUOTABLE_SQL)."""
+    if row.get("memory_type") != "dialogue":
+        return True
+    content = str(row.get("content") or "")
+    # Короткие строки («Да», «на») отсекает уже SQL по MIN_DIALOGUE_LENGTH; здесь — то, что
+    # по длине прошло, но цитатой быть не может.
+    if is_system_payload(content):
+        return False
+    return not (row.get("role") == "assistant" and len(content) > QUOTE_MAX_ASSISTANT_CHARS)
+
+
+def _episode_key(row: dict) -> tuple:
+    created = row.get("created_at")
+    day = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else str(created or "")
+    return day, str(row.get("chat_id") or "")
+
+
+# Основы слов, а не слова: «Ангелине» и «Ангелиной» — одна тема. Доля общих основ считается от
+# меньшей строки: пересказ скриншота длиннее вопроса в разы, и по Жаккару они «разные».
+STEM_LENGTH = 5
+EPISODE_OVERLAP = 0.4
+
+
+def _stems(text: str) -> set[str]:
+    return {word[:STEM_LENGTH] for word in content_words(text)}
+
+
+def _word_overlap(a: str, b: str) -> float:
+    sa, sb = _stems(a), _stems(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / min(len(sa), len(sb))
+
+
+# Сколько значимых основ цитата должна делить с вопросом. Полнотекст считает совпадением и
+# «просто», и «именно»: на «станешь ли ты просто ботом» он поднимал реплику «это просто выдержка
+# из памяти» по двум словам, из которых значимое — одно.
+MIN_SHARED_STEMS = 2
+
+
+def shares_stems(question: str, content: str, minimum: int = MIN_SHARED_STEMS) -> bool:
+    return len(_stems(question) & _stems(content)) >= minimum
+
+
+def collapse_episodes(rows: list[dict], limit: int = MAX_QUOTES, question: str = "") -> list[dict]:
+    """Одна цитата на эпизод: тот же день и тот же разговор, или тот же день и те же слова.
+
+    Вход уже отсортирован по убыванию релевантности, поэтому из эпизода остаётся лучшая.
+    С вопросом — ещё и только те строки, что делят с ним MIN_SHARED_STEMS значимых основ.
+    """
+    kept: list[dict] = []
+    for row in rows:
+        if not quotable(row):
+            continue
+        if question and not shares_stems(question, str(row.get("content") or "")):
+            continue
+        same = False
+        for other in kept:
+            if _episode_key(row) == _episode_key(other):
+                same = True
+                break
+            if (_episode_key(row)[0] == _episode_key(other)[0]
+                    and _word_overlap(str(row.get("content")), str(other.get("content"))) >= EPISODE_OVERLAP):
+                same = True
+                break
+        if same:
+            continue
+        kept.append(row)
+        if len(kept) >= limit:
+            break
+    return kept
 
 
 def combine_rrf(vector_hits: list[dict], fts_hits: list[dict], k: int = RRF_K) -> list[dict]:

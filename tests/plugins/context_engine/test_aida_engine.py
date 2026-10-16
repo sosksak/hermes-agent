@@ -362,7 +362,7 @@ def test_old_history_survives_the_second_request_of_the_same_turn():
     # Внутри хода запрос уходит несколько раз; раньше повторный получал только факты.
     store = _Store(found=[
         {"content": "факт", "memory_type": "fact", "created_at": None},
-        {"content": "давняя реплика про переезд, длинная", "memory_type": "dialogue", "role": "user", "created_at": None},
+        {"content": "давняя реплика: переезд решили в декабре", "memory_type": "dialogue", "role": "user", "created_at": None},
     ])
     engine = _engine(store)
     question = "что мы решили про переезд в декабре"
@@ -390,3 +390,79 @@ def test_a_two_word_command_gets_facts_but_no_quotes_from_old_talk():
     text = str(selected[-1]["content"])
     assert "правило про проверку" in text
     assert "Аткарск" not in text
+
+
+# -- уроки по активности и журнал отбора ---------------------------------------------------
+
+
+class _LessonStore(_Store):
+    def __init__(self, *, lessons=None, **kwargs):
+        super().__init__(**kwargs)
+        self.lessons = lessons or []
+        self.asked_activities = []
+
+    def lessons_for(self, activities, limit=6):
+        self.asked_activities.append(list(activities))
+        return list(self.lessons)
+
+
+def test_a_lesson_rides_on_the_kind_of_work_not_on_the_words_of_the_question():
+    lesson = {"id": 5, "content": "Когда: собираю HTML. Правило: гоняю node --check по инлайн-скрипту. "
+                                  "Почему: бэктик положил приложение. #сборка", "memory_type": "lesson"}
+    store = _LessonStore(lessons=[lesson], found=[])
+    eng = _engine(store)
+
+    question = "Собери index.html из html-частей и проверь, что всё работает"
+    selected = eng.select_context(_request(question), incoming_message={"role": "user", "content": question})
+
+    assert store.asked_activities and "сборка" in store.asked_activities[0]
+    last = str(selected[-1]["content"])
+    assert "# Уроки под эту задачу" in last and "node --check" in last
+    assert "бэктик" not in question
+
+
+def test_lessons_stand_above_quotes_in_the_question():
+    lesson = {"id": 5, "content": "Когда: пишу код. Правило: проверяю. Почему: ошибался. #код", "memory_type": "lesson"}
+    quote = {"id": 9, "content": "я тогда чинил баг в коде функции, которая считает смены", "memory_type": "dialogue",
+             "role": "user", "created_at": None}
+    store = _LessonStore(lessons=[lesson], found=[quote])
+
+    question = "почини баг в коде функции, которая считает смены"
+    last = str(_engine(store).select_context(_request(question), incoming_message={"role": "user", "content": question})[-1]["content"])
+
+    assert last.index("# Уроки под эту задачу") < last.index("# Из давнего разговора")
+
+
+def test_a_question_about_nothing_in_particular_asks_for_no_lessons():
+    store = _LessonStore(lessons=[], found=[])
+    question = "расскажи, что нового у тебя сегодня"
+
+    _engine(store).select_context(_request(question), incoming_message={"role": "user", "content": question})
+
+    assert store.asked_activities == []
+
+
+def test_the_recall_log_remembers_what_surfaced_and_what_was_cut(tmp_path, monkeypatch):
+    from plugins.memory.aida.recall_log import RecallLog
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(engine_module, "_open_recall_log", lambda: RecallLog(tmp_path / "aida_recall_log.db"))
+    found = [{"id": 1, "content": "переезд в декабре", "memory_type": "event", "created_at": None, "score": 0.03}]
+    store = _Store(found=found)
+    eng = _engine(store)
+
+    eng.select_context(_request(), incoming_message={"role": "user", "content": "что там с переездом"})
+
+    log = eng._recall_log
+    assert log is not None and log.totals(days=1) == (1, 1, 1)
+    assert log.top_surfaced(days=1)[0][:2] == (1, "event")
+    log.close()
+
+
+def test_a_store_without_lessons_still_works():
+    store = _Store(found=[{"content": "переезд в декабре", "memory_type": "event", "created_at": None}])
+    question = "почини код переезда"
+
+    selected = _engine(store).select_context(_request(question), incoming_message={"role": "user", "content": question})
+
+    assert "переезд в декабре" in str(selected[-1]["content"])

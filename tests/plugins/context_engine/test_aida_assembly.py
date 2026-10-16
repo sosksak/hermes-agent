@@ -129,13 +129,13 @@ def test_what_is_always_true_is_grouped_so_it_reads_as_a_map():
 
     block = build_knowledge_block(rows)
 
-    assert "ФАКТЫ ОБ ОПЕРАТОРЕ" in block
-    assert "ПРЕДПОЧТЕНИЯ ОПЕРАТОРА" in block
-    assert "КЛЮЧЕВЫЕ РЕШЕНИЯ" in block
+    # Разделы — в порядке чтения (кто → запреты → проекты → уроки → правила), см. SECTION_ORDER.
+    assert "## КТО ОПЕРАТОР" in block and "## ПРОЕКТЫ И РЕШЕНИЯ" in block
+    assert block.index("КТО ОПЕРАТОР") < block.index("ПРОЕКТЫ И РЕШЕНИЯ")
 
 
 def test_knowledge_of_an_unknown_kind_still_reaches_the_model():
-    assert "ПРОЧЕЕ" in build_knowledge_block([{"content": "нечто", "memory_type": "неизвестно"}])
+    assert "- нечто" in build_knowledge_block([{"content": "нечто", "memory_type": "неизвестно"}])
 
 
 def test_nothing_known_means_no_block_at_all():
@@ -371,14 +371,18 @@ def test_a_lost_anchor_falls_back_to_a_fresh_cut_instead_of_failing():
     assert tail and anchor != 12345
 
 
-def test_an_old_line_of_conversation_is_not_cut_at_four_hundred_signs():
+def test_an_old_line_of_conversation_is_an_excerpt_not_the_whole_record():
+    # Раньше цитата шла до 2 000 знаков «дословно»; на деле так в запрос ехал целый отчёт.
+    # Теперь — отрывок до 400 знаков, остальное достаётся aida_recall (решение 17.10.2026).
     long_line = "я думаю о переезде " * 60          # ~1 100 знаков
     rows = [{"content": long_line, "memory_type": "dialogue", "role": "user",
              "created_at": datetime(2026, 8, 12)}]
 
     block = build_old_history_block(rows)
+    quote = block.splitlines()[-1]
 
-    assert long_line.strip() in block and "[…]" not in block
+    assert quote.startswith("[2026-08-12] Оператор: я думаю о переезде") and quote.endswith("[…]")
+    assert len(quote) <= 400 + len("[2026-08-12] Оператор: ") + len(" […]")
 
 
 # -- старение выхлопа инструментов и бюджет от окна ----------------------------------------

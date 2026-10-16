@@ -458,3 +458,92 @@ def test_without_a_connection_string_the_night_says_so_and_changes_nothing(tmp_p
 
     assert nightly_job.run(tmp_path) == 0
     assert "не настроена" in capsys.readouterr().out
+
+
+# -- обёртки не едут как разговор, шум не едет как P1, повторы P1 схлопываются ------------
+
+
+def test_a_wrapper_or_a_delivery_is_not_shipped_as_a_line_of_conversation(tmp_path):
+    store = _Store()
+    queue = _queue(tmp_path, [
+        ("s", "user", '[Replying to: "старый ответ"] ваще кайфую, спасибо за разбор памяти'),
+        ("s", "user", "[ASYNC DELEGATION BATCH COMPLETE — 2 tasks] результаты субагентов ниже по тексту"),
+        ("s", "user", "а вот это я сказал сам, без обёрток, и это должно доехать"),
+    ])
+    try:
+        shipped, _ = nightly_job.ship_turns(store, queue)
+
+        assert shipped == 1
+        assert [row["content"] for row in store.saved] == ["а вот это я сказал сам, без обёрток, и это должно доехать"]
+        assert queue.count() == 0  # обёртки отпущены из очереди, а не оставлены ждать
+    finally:
+        queue.close()
+
+
+def test_a_version_or_a_commit_in_a_fact_keeps_it_out_of_p1():
+    facts = nightly_job.parse_facts(
+        '[{"content": "Life Tracker v9.20.0 перенесён на Svelte 5 (коммит 54de603)", "type": "project", "priority": "P1"},'
+        ' {"content": "Оператора зовут Даня", "type": "fact", "priority": "P1"}]'
+    )
+
+    assert [(f["content"][:12], f["priority"]) for f in facts] == [("Life Tracker", "P2"), ("Оператора зо", "P1")]
+
+
+def test_the_distill_prompt_teaches_the_lesson_format():
+    assert "lesson" in nightly_job.SYSTEM_PROMPT
+    assert "Когда: " in nightly_job.SYSTEM_PROMPT and "#код" in nightly_job.SYSTEM_PROMPT
+
+
+class _StandingStore(_Store):
+    def __init__(self, standing: list[int]):
+        super().__init__()
+        self.standing = standing
+
+    def standing_ids(self, limit):
+        return self.standing[:limit]
+
+
+def _standing_store():
+    store = _StandingStore([1605, 1603, 1450])
+    store.contents = {1605: "Не додумывать состояние (недосып, усталость, опьянение) — считать в норме.",
+                      1603: "Не додумывать состояние (недосып, усталость, «на взводе») — раздражает.",
+                      1450: "Пользователь предпочитает отдыхать при высокой усталости вместо кодирования."}
+    store.neighbours = {
+        1605: [{"id": 1603, "content": store.contents[1603]}, {"id": 1450, "content": store.contents[1450]}],
+        1603: [{"id": 1450, "content": store.contents[1450]}],
+    }
+    return store
+
+
+def test_repeated_wordings_of_one_standing_rule_collapse_into_the_newest(monkeypatch):
+    asked = []
+
+    def judge(messages):
+        asked.append(messages[-1]["content"])
+        return "[1603]"  # повтор — 1603; 1450 — про другое (отдых), остаётся
+
+    monkeypatch.setattr(nightly_job, "ask_model", judge)
+    store = _standing_store()
+
+    count, retired = nightly_job.supersede_standing(store)
+
+    assert count == 1 and store.archived == [1603]
+    assert retired == [{"id": 1603, "content": store.contents[1603], "kept": 1605}]
+    assert len(asked) == 1  # 1603 уже убрана — второй раз её не судят; у 1450 соседей нет
+
+
+def test_the_standing_pass_keeps_the_same_guardrails(monkeypatch):
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: "[1605, 999, 1450]")
+    store = _standing_store()
+
+    count, _ = nightly_job.supersede_standing(store)
+
+    assert count == 1 and store.archived == [1450]  # только показанные и только более старые
+
+
+def test_a_silent_judge_collapses_nothing(monkeypatch):
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: None)
+    store = _standing_store()
+
+    assert nightly_job.supersede_standing(store) == (0, [])
+    assert not getattr(store, "archived", [])

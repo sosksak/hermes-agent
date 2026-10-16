@@ -33,11 +33,13 @@ from typing import Iterable
 
 try:  # обычный путь: модуль плагина
     from .queue_db import TurnQueue
-    from .write import normalise_type, source_tag
+    from .search import is_system_payload
+    from .write import effective_priority, normalise_type, source_tag
 except ImportError:  # запуск файлом, как его зовёт расписание
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from plugins.memory.aida.queue_db import TurnQueue
-    from plugins.memory.aida.write import normalise_type, source_tag
+    from plugins.memory.aida.search import is_system_payload
+    from plugins.memory.aida.write import effective_priority, normalise_type, source_tag
 
 # Сколько работы за один прогон. Ограничения стоят не ради скорости, а ради чужой квоты:
 # ключ к моделям общий с ботом, и его ответы человеку не должны её терять.
@@ -50,6 +52,12 @@ EMBED_BATCH = 8
 MAX_SUPERSEDE_PER_RUN = 60
 SUPERSEDE_MIN_SIM = 0.7
 SUPERSEDE_NEIGHBOURS = 5
+# Тот же проход по уже лежащему знанию P1: ночной охват — только новые строки, и четыре
+# формулировки одного правила «не додумывать усталость», записанные в разные дни, друг с
+# другом так и не встречались. Порог выше, чем у новых (0.8): здесь нет «новой» стороны,
+# которую модель могла бы сравнить с прежним состоянием, только повторы.
+MAX_STANDING_PER_RUN = 40
+STANDING_MIN_SIM = 0.8
 
 # Короче этого — «ок», «ага», «поправляй». Порог взят у бота: он измерен на его переписке.
 MIN_EXCHANGE_LENGTH = 12
@@ -91,7 +99,11 @@ SYSTEM_PROMPT = """Ты — экстрактор фактов из диалог�
 Формат каждого элемента:
 {"content": "факт одним предложением от третьего лица", "type": "...", "priority": "P1"|"P2"}
 
-type — одно из: fact, decision, preference, event, context, rule, project, contact
+type — одно из: fact, decision, preference, event, context, rule, project, contact, lesson
+
+lesson — особый тип: вывод из ошибки, который меняет поведение в будущем. Если в диалоге ассистент ошибся и стало ясно, как не повторить, — запиши урок строго в формате:
+"Когда: <в какой ситуации применять>. Правило: <что делать>. Почему: <из чего вывод>. #тег"
+где #тег — один или несколько из: #код #сборка #деньги #сообщение #память. Без дат, версий и номеров коммитов.
 
 priority:
 - P1 — устойчивое и важное: личные данные пользователя, принятые решения, правила и принципы работы, ключевые факты о проекте, стабильные предпочтения.
@@ -136,10 +148,18 @@ def load_profile_env(hermes_home: Path) -> None:
 
 
 def ship_turns(store, queue, limit: int = MAX_TURNS_PER_RUN) -> tuple[int, list[dict]]:
-    """Перенести реплики из очереди в общую базу. Возвращает счёт и то, что доехало."""
+    """Перенести реплики из очереди в общую базу. Возвращает счёт и то, что доехало.
+
+    Реплика, начинающаяся с «[», — обёртка шлюза, доставка субагента или кусок вставки: роль
+    у неё человеческая, но говорит в ней не человек. В базу как разговор она не едет (и на
+    разбор сути — тоже: сути там нет, там чужой результат).
+    """
     pending = queue.pending(limit=limit)
     shipped: list[dict] = []
     for turn in pending:
+        if is_system_payload(turn["content"]):
+            queue.release([turn["id"]])
+            continue
         ids = store.save(
             turn["content"],
             memory_type="dialogue",
@@ -207,7 +227,7 @@ def parse_facts(raw: str) -> list[dict]:
         facts.append({
             "content": content,
             "type": normalise_type(item.get("type")),
-            "priority": "P1" if item.get("priority") == "P1" else "P2",
+            "priority": effective_priority(content, "P1" if item.get("priority") == "P1" else "P2"),
         })
         if len(facts) >= MAX_FACTS_PER_EXCHANGE:
             break
@@ -385,17 +405,51 @@ def supersede(store, new_ids: Iterable[int], limit: int = MAX_SUPERSEDE_PER_RUN)
         fresh = store.content_of(new_id)
         if not fresh:
             continue
-        listing = "\n".join(f"[{n['id']}] {n['content']}" for n in neighbours)
-        answer = ask_model([
-            {"role": "system", "content": SUPERSEDE_PROMPT},
-            {"role": "user", "content": f"НОВАЯ:\n{fresh}\n\nСТАРЫЕ:\n{listing}"},
-        ])
-        if not answer:
-            continue  # молчание модели — не повод трогать память
-        allowed = {n["id"] for n in neighbours}
-        to_retire = [i for i in parse_ids(answer) if i in allowed]
-        retired += store.archive_ids(to_retire)
+        retired += store.archive_ids(_ask_which_to_retire(fresh, neighbours))
     return retired
+
+
+def _ask_which_to_retire(fresh: str, neighbours: list[dict]) -> list[int]:
+    """Спросить модель, какие соседи лишние; только id из списка, молчание — ничего."""
+    listing = "\n".join(f"[{n['id']}] {n['content']}" for n in neighbours)
+    answer = ask_model([
+        {"role": "system", "content": SUPERSEDE_PROMPT},
+        {"role": "user", "content": f"НОВАЯ:\n{fresh}\n\nСТАРЫЕ:\n{listing}"},
+    ])
+    if not answer:
+        return []  # молчание модели — не повод трогать память
+    allowed = {n["id"] for n in neighbours}
+    return [i for i in parse_ids(answer) if i in allowed]
+
+
+def supersede_standing(store, limit: int = MAX_STANDING_PER_RUN,
+                       min_sim: float = STANDING_MIN_SIM) -> tuple[int, list[dict]]:
+    """Схлопнуть повторы среди уже лежащего знания P1. Возвращает счёт и список убранных.
+
+    Для каждой строки P1, свежие первыми, ищутся более старые соседи ближе min_sim; какие из
+    них лишние — решает модель по тем же правилам, что и для новых фактов. Строка, уже
+    убранная в этом проходе, второй раз не рассматривается.
+    """
+    retired: list[dict] = []
+    gone: set[int] = set()
+    for row_id in store.standing_ids(limit):
+        if row_id in gone:
+            continue
+        neighbours = [n for n in store.similar_to(row_id, min_sim, SUPERSEDE_NEIGHBOURS)
+                      if n["id"] < row_id and n["id"] not in gone]
+        if not neighbours:
+            continue
+        fresh = store.content_of(row_id)
+        if not fresh:
+            continue
+        to_retire = _ask_which_to_retire(fresh, neighbours)
+        if not to_retire:
+            continue
+        if store.archive_ids(to_retire):
+            gone.update(to_retire)
+            retired += [{"id": n["id"], "content": n["content"], "kept": row_id}
+                        for n in neighbours if n["id"] in to_retire]
+    return len(retired), retired
 
 
 # ─── Прогон ───────────────────────────────────────────────────────────────────
@@ -422,12 +476,15 @@ def run(hermes_home: Path) -> int:
         facts, fact_ids = distill(store, queue)
         filled, left = backfill_embeddings(store)
         retired = supersede(store, fact_ids)
+        collapsed, collapsed_rows = supersede_standing(store)
 
         print("Ночная работа общей памяти")
         print(f"  разговор: довезено {shipped} реплик из {waiting}, ждут ещё {queue.count()}")
         print(f"  суть: записано фактов — {facts}, ждут разбора {queue.count_exchanges()} обменов")
         print(f"  поиск по смыслу: дозаполнено {filled}, осталось без него {left}")
-        print(f"  порядок: убрано устаревших записей — {retired}")
+        print(f"  порядок: убрано устаревших записей — {retired}, схлопнуто повторов в P1 — {collapsed}")
+        for row in collapsed_rows:
+            print(f"    − [{row['id']}] {' '.join(str(row['content']).split())[:90]} (осталась [{row['kept']}])")
         if not store.alive():
             print("  база в эту ночь была недоступна — всё, что не доехало, ждёт в очереди")
     finally:

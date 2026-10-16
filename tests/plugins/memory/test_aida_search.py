@@ -110,13 +110,18 @@ def test_vector_literal_is_what_pgvector_parses():
 def test_row_to_memory_keeps_the_column_order_the_sql_selects():
     created = datetime(2026, 9, 21)
 
-    assert row_to_memory((11, "текст", "decision", "P1", created, 4.2)) == {
+    assert row_to_memory((11, "текст", "decision", "P1", created, "user", "hermes:s", 4.2)) == {
         "id": 11,
         "content": "текст",
         "memory_type": "decision",
         "priority": "P1",
         "created_at": created,
+        "role": "user",
+        "chat_id": "hermes:s",
+        "rank": 4.2,
     }
+    # Короткая строка (например, из SIMILAR_SQL) читается без роли и оценки, не падая.
+    assert row_to_memory((11, "текст", "decision", "P1", created))["role"] is None
 
 
 def test_match_floor_stays_in_step_with_the_bot():

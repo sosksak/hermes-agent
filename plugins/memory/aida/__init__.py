@@ -28,6 +28,7 @@ from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
 from . import recall_signal
+from .lessons import LESSONS_SQL, format_lesson, tag_pattern
 from .queue_db import TurnQueue
 from .search import (
     FTS_SQL,
@@ -49,6 +50,7 @@ from .write import (
     SOURCE_PREFIX,
     chunk_content,
     describe_saved,
+    effective_priority,
     insert_params,
     normalise_type,
     source_tag,
@@ -99,6 +101,19 @@ REMEMBER_SCHEMA = {
                 "type": "string",
                 "enum": list(PRIORITIES),
                 "description": "P1 stays, P3 fades (default: P2).",
+            },
+            "trigger": {
+                "type": "string",
+                "description": "For memory_type=lesson: when the lesson applies, in plain words.",
+            },
+            "why": {
+                "type": "string",
+                "description": "For memory_type=lesson: what the rule was learned from (no dates or commit ids).",
+            },
+            "activities": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["код", "сборка", "деньги", "сообщение", "память"]},
+                "description": "For memory_type=lesson: which kinds of work surface it (code edits, HTML builds, money, writing to a person, memory work).",
             },
         },
         "required": ["content"],
@@ -356,6 +371,32 @@ class _Store:
         rows = self._execute_guarded("SELECT content FROM memories WHERE id = %(id)s", {"id": int(row_id)})
         return str(rows[0][0]) if rows else ""
 
+    def standing_ids(self, limit: int) -> list[int]:
+        """Активное знание P1 (не диалог), свежие первыми — для ночного схлопывания повторов."""
+        rows = self._execute_guarded(
+            "SELECT id FROM memories WHERE status = 'active' AND priority = 'P1'"
+            " AND memory_type NOT IN ('dialogue', 'event') AND embedding IS NOT NULL"
+            " ORDER BY created_at DESC LIMIT %(limit)s",
+            {"limit": int(limit)},
+        )
+        return [int(r[0]) for r in rows]
+
+    def lessons_for(self, activities: list[str], limit: int = 6) -> list[dict]:
+        """Уроки по тегу активности, свежие первыми; без тегов — ничего."""
+        if not activities:
+            return []
+        rows = self._execute_guarded(LESSONS_SQL, {"pattern": tag_pattern(activities), "limit": int(limit)})
+        return [row_to_memory(r) for r in rows]
+
+    def archive_wrapped_dialogue(self) -> int:
+        """Убрать в архив строки разговора, начинающиеся с «[» — обёртки и доставки, не речь."""
+        rows = self._execute_guarded(
+            "UPDATE memories SET status = 'archived' WHERE status = 'active' AND memory_type = 'dialogue'"
+            " AND left(ltrim(content), 1) = '[' RETURNING id",
+            {},
+        )
+        return len(rows)
+
     def archive_ids(self, ids: list[int]) -> int:
         """Archive memories by id — used by the nightly pass that merges duplicates."""
         if not ids:
@@ -555,10 +596,18 @@ class AidaMemoryProvider(MemoryProvider):
         if not self._writes_enabled:
             return tool_error("This agent does not write to the shared memory")
         memory_type = normalise_type(args.get("memory_type"))
+        if memory_type == "lesson":
+            # Урок — три поля в одной строке и тег, по которому он поднимется в нужной работе.
+            content = format_lesson(
+                str(args.get("trigger") or "когда делаю похожее"),
+                content,
+                str(args.get("why") or "так уже ошибался"),
+                [str(a) for a in (args.get("activities") or [])],
+            )
         written = self._store.save(
             content,
             memory_type=memory_type,
-            priority=str(args.get("priority") or "P2"),
+            priority=effective_priority(content, str(args.get("priority") or "P2")),
             role="assistant",
             chat_id=source_tag(self._session_id),
         )
