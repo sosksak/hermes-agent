@@ -34,13 +34,19 @@ from agent.context_engine import ContextEngine
 
 from .assembly import (
     KNOWLEDGE_BUDGET,
+    LESSONS_BUDGET,
     OLD_HISTORY_BUDGET,
     RECALLED_BUDGET,
     TOTAL_BUDGET,
+    _quote_line,
+    _tagged_line,
     assemble_with_anchor,
     build_knowledge_block,
+    build_lessons_block,
     build_old_history_block,
     build_recalled_block,
+    choose_within_budget,
+    select_quotes,
     message_key,
     message_size,
     safe_tail,
@@ -75,11 +81,43 @@ def strip_wrappers(text: str) -> str:
 
 # Всё знание P1 целиком: отбор по важности и свежести делает build_knowledge_block, потому что
 # «последние 60 по дате» теряли старые решения, а резались на бюджете посреди строки.
+# Событие — не «знаю всегда», ему в этом блоке делать нечего при любом приоритете.
 P1_SQL = """
 SELECT content, memory_type FROM memories
-WHERE status = 'active' AND priority = 'P1' AND memory_type <> 'dialogue'
+WHERE status = 'active' AND priority = 'P1' AND memory_type NOT IN ('dialogue', 'event')
 ORDER BY created_at DESC
 """
+
+LESSONS_LIMIT = 6
+
+
+def _detect_activities(question: str) -> list[str]:
+    try:
+        from plugins.memory.aida.lessons import detect_activities
+
+        return detect_activities(question)
+    except Exception:
+        return []
+
+
+def _open_recall_log():
+    """Журнал отбора рядом с очередью памяти; без него работаем, как работали."""
+    try:
+        import os
+        from pathlib import Path
+
+        from plugins.memory.aida.recall_log import DB_NAME, RecallLog
+
+        try:
+            from hermes_constants import get_hermes_home
+
+            home = get_hermes_home()
+        except Exception:
+            home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        return RecallLog(Path(home) / DB_NAME)
+    except Exception:
+        logger.debug("Витрина: журнал отбора недоступен, отбор не записывается", exc_info=True)
+        return None
 
 
 class _NoSignal:
@@ -144,7 +182,10 @@ class AidaContextEngine(ContextEngine):
         self.total_budget = TOTAL_BUDGET
         self._lock = threading.Lock()
         self._knowledge: tuple[float, str] = (0.0, "")
-        self._dynamic: tuple[float, str, tuple[str, str]] = (0.0, "", ("", ""))  # время, ключ, (факты, цитаты)
+        # время, ключ, (уроки, факты, цитаты)
+        self._dynamic: tuple[float, str, tuple[str, str, str]] = (0.0, "", ("", "", ""))
+        self._recall_log: Any = None
+        self._recall_log_tried = False
         self._store: Any = None
         self._store_tried = False
         self._recall_signal = _load_recall_signal()
@@ -204,7 +245,7 @@ class AidaContextEngine(ContextEngine):
             system_head, conversation = split_system(request_messages)
             question = self._question_text(request_messages, incoming_message)
             knowledge = self._knowledge_block(store)
-            recalled, old_history = self._dynamic_blocks(store, question)
+            lessons, recalled, old_history = self._dynamic_blocks(store, question)
             conversation_key = message_key(conversation[0]) if conversation else None
             with self._lock:
                 anchor = self._anchors.get(conversation_key)
@@ -212,7 +253,7 @@ class AidaContextEngine(ContextEngine):
                 self.total_budget = total_budget_for(budget_tokens)
             assembled, new_anchor, aged_count = assemble_with_anchor(
                 system_head, knowledge, recalled, old_history, conversation,
-                total_budget=self.total_budget, anchor=anchor)
+                total_budget=self.total_budget, anchor=anchor, lessons=lessons)
             if conversation_key is not None:
                 with self._lock:
                     grew = aged_count > self._aged_counts.get(conversation_key, 0)
@@ -280,21 +321,22 @@ class AidaContextEngine(ContextEngine):
             self._knowledge = (time.monotonic(), block)
         return block
 
-    def _dynamic_blocks(self, store: Any, question: str) -> tuple[str, str]:
-        """Найденное под вопрос: записи по смыслу и куски давнего разговора.
+    def _dynamic_blocks(self, store: Any, question: str) -> tuple[str, str, str]:
+        """Найденное под вопрос: уроки под эту работу, записи по смыслу и куски давнего разговора.
 
-        Один поиск на оба блока: разговорные строки лежат в той же таблице, что и факты,
-        и отличаются только типом.
+        Один поиск на факты и цитаты: разговорные строки лежат в той же таблице, что и факты,
+        и отличаются только типом. Уроки — отдельной выборкой по тегу активности: урок про
+        node --check должен приехать на любую сборку, даже без слова «бэктик» в вопросе.
         """
         question = (question or "").strip()
         if not question:
-            return "", ""
+            return "", "", ""
         question = strip_wrappers(question)
         if not _worth_searching(question):
             # «?», «на», «😂😂😂»: искать нечего. Поиск по такому всегда что-то возвращает —
             # такие же обрывки, — и модель отвечала на них вместо реплики человека.
             self._recall_signal.publish(0)
-            return "", ""
+            return "", "", ""
         key = question[:400]
         with self._lock:
             stamped, cached_key, cached = self._dynamic
@@ -302,20 +344,56 @@ class AidaContextEngine(ContextEngine):
                 return cached
 
         found = store.recall(question, RECALL_LIMIT + OLD_HISTORY_LIMIT)
-        facts = [row for row in found if row.get("memory_type") != "dialogue"][:RECALL_LIMIT]
-        talk = ([row for row in found if row.get("memory_type") == "dialogue"][:OLD_HISTORY_LIMIT]
+        activities = _detect_activities(question)
+        lesson_rows = (store.lessons_for(activities, LESSONS_LIMIT)
+                       if activities and hasattr(store, "lessons_for") else [])
+        lesson_ids = {row.get("id") for row in lesson_rows}
+        facts = [row for row in found
+                 if row.get("memory_type") != "dialogue" and row.get("id") not in lesson_ids][:RECALL_LIMIT]
+        talk = (select_quotes([row for row in found if row.get("memory_type") == "dialogue"][:OLD_HISTORY_LIMIT],
+                              question=question)
                 if _worth_quoting(question) else [])
-        recalled = build_recalled_block(facts, RECALLED_BUDGET)
-        old_history = build_old_history_block(talk, OLD_HISTORY_BUDGET)
+        kept_lessons = choose_within_budget(
+            lesson_rows, lambda r: "- " + " ".join(str(r.get("content", "")).split()), LESSONS_BUDGET)
+        kept_facts = choose_within_budget(facts, _tagged_line, RECALLED_BUDGET)
+        kept_talk = choose_within_budget(talk, _quote_line, OLD_HISTORY_BUDGET)
+        lessons = build_lessons_block([row for row, _ in kept_lessons], LESSONS_BUDGET)
+        recalled = build_recalled_block([row for row, _ in kept_facts], RECALLED_BUDGET)
+        old_history = build_old_history_block([row for row, _ in kept_talk], OLD_HISTORY_BUDGET)
         # Оператор договорился, что подъём памяти всегда видно. Ищет теперь движок, но
         # отметку по-прежнему ставит память — число едет к ней отсюда.
-        self._recall_signal.publish(len(facts) + len(talk))
+        self._recall_signal.publish(len(kept_lessons) + len(kept_facts) + len(kept_talk))
+        self._log_recall(question, (("уроки", lesson_rows, kept_lessons), ("факты", facts, kept_facts),
+                                    ("цитаты", talk, kept_talk)))
 
         with self._lock:
-            # Кэшируем оба блока как есть: внутри хода запрос уходит несколько раз, и раньше
+            # Кэшируем все блоки как есть: внутри хода запрос уходит несколько раз, и раньше
             # повторный запрос получал только факты — цитаты давнего разговора терялись.
-            self._dynamic = (time.monotonic(), key, (recalled, old_history))
-        return recalled, old_history
+            self._dynamic = (time.monotonic(), key, (lessons, recalled, old_history))
+        return lessons, recalled, old_history
+
+    def _log_recall(self, question: str, blocks) -> None:
+        """Записать в журнал, что поднялось и что доехало; любая ошибка здесь глотается."""
+        if not self._recall_log_tried:
+            self._recall_log_tried = True
+            self._recall_log = _open_recall_log()
+        if self._recall_log is None:
+            return
+        entries = []
+        for block, rows, kept in blocks:
+            kept_ids = {id(row) for row, _ in kept}
+            sizes = {id(row): len(line) for row, line in kept}
+            for row in rows:
+                entries.append({
+                    "id": row.get("id"), "memory_type": row.get("memory_type"), "block": block,
+                    "score": row.get("score", row.get("rank")),
+                    "chars": sizes.get(id(row), len(" ".join(str(row.get("content", "")).split()))),
+                    "kept": id(row) in kept_ids,
+                })
+        try:
+            self._recall_log.record(question, entries)
+        except Exception:
+            logger.debug("Витрина: журнал отбора не записался", exc_info=True)
 
     def _get_store(self) -> Any:
         """Та же база, что у памяти Гермеса. Второго подключения не заводим."""

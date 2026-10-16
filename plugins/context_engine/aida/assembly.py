@@ -8,17 +8,23 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 # Бюджеты в символах — как в том движке, что работал на сервере. Символы, а не токены,
 # потому что считать их нечем и незачем: это витрина, а не бухгалтерия.
 TOTAL_BUDGET = 150_000
-KNOWLEDGE_BUDGET = 12_000
+# Блок «знаю всегда» на 12 000 знаков (89 строк плоским списком) модель пролистывала, а не
+# выполняла: запрет «Life Tracker не трогать» стоял после десяти строк про Life Tracker. Это
+# не хранилище, а то, что читается перед каждым ответом, — размер страницы, не главы.
+KNOWLEDGE_BUDGET = 2_500
 RECALLED_BUDGET = 15_000
+LESSONS_BUDGET = 3_000
 OLD_HISTORY_BUDGET = 10_000
-# Цитата давнего разговора режется только по размеру самой записи в базе (она не бывает длиннее
-# ~2 000 знаков): «дословно» не должно значить «до 400 знаков и многоточие».
-OLD_QUOTE_CLIP = 2_000
+# Цитата — отрывок, а не документ. На 2 000 знаков цитатой становился целый отчёт ассистента;
+# отрывка в 400 знаков хватает, чтобы узнать разговор, а остальное достаётся aida_recall.
+OLD_QUOTE_CLIP = 400
+MAX_OLD_QUOTES = 2
 MIN_TAIL_BUDGET = 20_000
 # Бюджет запроса от окна модели: 5% окна, в знаках. Для окна в миллион токенов это прежние
 # 150 000; для меньшего окна число меньше, но не ниже MIN_TOTAL_BUDGET. Знаки, а не токены, потому
@@ -50,6 +56,33 @@ GROUP_LABELS = {
     "event": "СОБЫТИЯ",
     "lesson": "УРОКИ",
 }
+
+# Разделы блока «знаю всегда» — в порядке чтения, не в порядке типов: кто человек → что
+# запрещено → чем занят → что усвоено → как работать. Запрет должен быть прочитан раньше, чем
+# десять строк про проект, который он запрещает трогать.
+SECTION_IDENTITY = "КТО ОПЕРАТОР"
+SECTION_BANS = "ЗАПРЕТЫ И ГРАНИЦЫ"
+SECTION_PROJECTS = "ПРОЕКТЫ И РЕШЕНИЯ"
+SECTION_LESSONS = "УРОКИ"
+SECTION_RULES = "ПРАВИЛА РАБОТЫ"
+SECTION_ORDER = (SECTION_IDENTITY, SECTION_BANS, SECTION_PROJECTS, SECTION_LESSONS, SECTION_RULES)
+_SECTION_BY_TYPE = {
+    "preference": SECTION_IDENTITY, "fact": SECTION_IDENTITY, "contact": SECTION_IDENTITY,
+    "project": SECTION_PROJECTS, "decision": SECTION_PROJECTS, "context": SECTION_PROJECTS,
+    "lesson": SECTION_LESSONS,
+    "rule": SECTION_RULES,
+}
+# Запрет узнаётся по формулировке, из любого типа: «не трогать», «не упоминать», «нельзя».
+_BAN_RE = re.compile(
+    r"\b(не трога|нельзя|никогда|запрещ|не упомина|не додумыва|не предлага|не использ|не спрашива|"
+    r"не писа|не отправля|не звон|без вступлен|только готовый)",
+    re.IGNORECASE,
+)
+# Событие — не знание: в блок оно не идёт, даже с P1 (см. write.is_operational про шум).
+_SKIPPED_TYPES = frozenset({"event", "dialogue"})
+# Две строки с такой долей общих значимых слов — одна мысль, записанная дважды. Настоящее
+# схлопывание делает ночная работа; здесь — страховка витрины, чтобы повтор не ехал сегодня.
+DUPLICATE_OVERLAP = 0.6
 
 
 def is_system(message: dict) -> bool:
@@ -228,25 +261,66 @@ def _clip(text: str, budget: int) -> str:
     return text[:budget].rstrip() + " […]"
 
 
+def _is_operational(content: str) -> bool:
+    try:
+        from plugins.memory.aida.write import is_operational
+
+        return is_operational(content)
+    except Exception:
+        return False
+
+
+def _words(text: str) -> set[str]:
+    try:
+        from plugins.memory.aida.search import content_words
+
+        return set(content_words(text))
+    except Exception:
+        return {w for w in re.findall(r"\w+", text.lower()) if len(w) >= 4}
+
+
+def _near_duplicate(item: str, seen: list[set[str]]) -> bool:
+    words = _words(item)
+    if not words:
+        return False
+    for other in seen:
+        if other and len(words & other) / len(words | other) >= DUPLICATE_OVERLAP:
+            return True
+    return False
+
+
+def section_of(row: dict) -> str | None:
+    """В какой раздел блока идёт строка; None — не идёт вовсе (событие, шум, диалог)."""
+    memory_type = row.get("memory_type") or ""
+    content = str(row.get("content") or "")
+    if memory_type in _SKIPPED_TYPES or _is_operational(content):
+        return None
+    if memory_type != "lesson" and _BAN_RE.search(content):
+        return SECTION_BANS
+    return _SECTION_BY_TYPE.get(memory_type, SECTION_PROJECTS)
+
+
 def build_knowledge_block(rows: Iterable[dict], budget: int = KNOWLEDGE_BUDGET) -> str:
-    """То, что верно всегда: знание с приоритетом P1, сгруппированное по типам.
+    """То, что верно всегда: знание с приоритетом P1, разложенное по разделам в порядке чтения.
 
     Записей больше, чем влезает (на 13.10.2026 — 481 на 67 000 знаков), поэтому отбор, а не
-    обрезка: строки берутся по кругу из каждой группы в порядке прихода (свежие первыми), пока
-    есть бюджет. Так редкая группа — правила, решения, контакты — не вытесняется толпой
-    проектных заметок, а обрезанных на полуслове строк нет вовсе.
+    обрезка: строки берутся по кругу из каждого раздела в порядке прихода (свежие первыми),
+    пока есть бюджет, — редкий раздел (запреты, уроки) не вытесняется толпой проектных заметок,
+    а обрезанных на полуслове строк нет вовсе. Внутри раздела строки идут по типу: сначала
+    редкие (контакты, решения), потом частые. Событие, операционный шум (хеш, версия,
+    «задеплоено») и повтор уже взятой строки в блок не попадают.
     """
-    grouped: dict[str, list[str]] = {}
+    grouped: dict[str, list[str]] = {label: [] for label in SECTION_ORDER}
     for row in rows:
-        label = GROUP_LABELS.get(row.get("memory_type") or "", "ПРОЧЕЕ")
+        section = section_of(row)
         item = " ".join(str(row.get("content", "")).split())
-        if item:
-            grouped.setdefault(label, []).append(item)
-    if not grouped:
+        if section and item:
+            grouped[section].append(item)
+    order = [label for label in SECTION_ORDER if grouped[label]]
+    if not order:
         return ""
-    order = [label for label in GROUP_LABELS.values() if label in grouped]
-    order += [label for label in grouped if label not in order]
     chosen: dict[str, list[str]] = {label: [] for label in order}
+    seen_words: list[set[str]] = []
     spent = sum(len(f"\n\n## {label}") for label in order) + len("# Что я знаю всегда")
     cursors = {label: 0 for label in order}
     progressed = True
@@ -257,12 +331,16 @@ def build_knowledge_block(rows: Iterable[dict], budget: int = KNOWLEDGE_BUDGET) 
             index = cursors[label]
             if index >= len(items):
                 continue
-            line = f"\n- {items[index]}"
+            item = items[index]
             cursors[label] = index + 1
             progressed = True
+            if _near_duplicate(item, seen_words):
+                continue  # та же мысль уже в блоке
+            line = f"\n- {item}"
             if spent + len(line) > budget:
-                continue  # эта не влезла; следующая в группе может быть короче
-            chosen[label].append(items[index])
+                continue  # эта не влезла; следующая в разделе может быть короче
+            chosen[label].append(item)
+            seen_words.append(_words(item))
             spent += len(line)
     lines = ["# Что я знаю всегда"]
     for label in order:
@@ -274,47 +352,75 @@ def build_knowledge_block(rows: Iterable[dict], budget: int = KNOWLEDGE_BUDGET) 
     return "\n".join(lines)
 
 
-def build_recalled_block(rows: Iterable[dict], budget: int = RECALLED_BUDGET) -> str:
-    """Найденное по смыслу этого вопроса."""
-    lines = []
+def choose_within_budget(rows: Iterable[dict], render, budget: int) -> list[tuple[dict, str]]:
+    """Строки по порядку, пока влезают целиком. Возвращает пары (строка, её текст в блоке)."""
+    chosen: list[tuple[dict, str]] = []
     spent = 0
     for row in rows:
-        content = " ".join(str(row.get("content", "")).split())
-        created = row.get("created_at")
-        when = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else ""
-        tag = " · ".join(part for part in (row.get("memory_type"), when) if part)
-        line = f"- [{tag}] {content}" if tag else f"- {content}"
+        line = render(row)
         if spent + len(line) > budget:
             break
-        lines.append(line)
+        chosen.append((row, line))
         spent += len(line)
-    if not lines:
+    return chosen
+
+
+def _tagged_line(row: dict) -> str:
+    content = " ".join(str(row.get("content", "")).split())
+    created = row.get("created_at")
+    when = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else ""
+    tag = " · ".join(part for part in (row.get("memory_type"), when) if part)
+    return f"- [{tag}] {content}" if tag else f"- {content}"
+
+
+def build_lessons_block(rows: Iterable[dict], budget: int = LESSONS_BUDGET) -> str:
+    """Уроки под то, что человек сейчас делает. Без дат: урок — правило, а не событие."""
+    chosen = choose_within_budget(rows, lambda r: "- " + " ".join(str(r.get("content", "")).split()), budget)
+    if not chosen:
         return ""
-    return "# Вспомнил под этот вопрос\n" + "\n".join(lines)
+    return "# Уроки под эту задачу\n" + "\n".join(line for _, line in chosen)
+
+
+def build_recalled_block(rows: Iterable[dict], budget: int = RECALLED_BUDGET) -> str:
+    """Найденное по смыслу этого вопроса."""
+    chosen = choose_within_budget(rows, _tagged_line, budget)
+    if not chosen:
+        return ""
+    return "# Вспомнил под этот вопрос\n" + "\n".join(line for _, line in chosen)
+
+
+def _quote_line(row: dict) -> str:
+    content = " ".join(str(row.get("content", "")).split())
+    created = row.get("created_at")
+    when = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else ""
+    who = "Оператор" if row.get("role") == "user" else "Я"
+    return (f"[{when}] {who}: {_clip(content, OLD_QUOTE_CLIP)}" if when
+            else f"{who}: {_clip(content, OLD_QUOTE_CLIP)}")
+
+
+def select_quotes(rows: Iterable[dict], limit: int = MAX_OLD_QUOTES, question: str = "") -> list[dict]:
+    """Какие строки разговора вообще цитировать: не монолог, не обёртка, по одной на эпизод,
+    и только те, что делят с вопросом хотя бы две значимые основы слов."""
+    rows = list(rows)
+    try:
+        from plugins.memory.aida.search import collapse_episodes
+
+        return collapse_episodes(rows, limit, question)
+    except Exception:
+        return [r for r in rows if not str(r.get("content", "")).lstrip().startswith("[")][:limit]
 
 
 def build_old_history_block(rows: Iterable[dict], budget: int = OLD_HISTORY_BUDGET) -> str:
     """Куски давнего разговора, которые всплыли по смыслу вопроса.
 
     Дословно, с датой и с указанием, кто говорил: это не пересказ, а цитата из того, что
-    было сказано на самом деле.
+    было сказано на самом деле. Не больше MAX_OLD_QUOTES и не длиннее OLD_QUOTE_CLIP каждая:
+    цитата — чтобы узнать разговор, а не чтобы перечитать его.
     """
-    lines = []
-    spent = 0
-    for row in rows:
-        content = " ".join(str(row.get("content", "")).split())
-        created = row.get("created_at")
-        when = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else ""
-        who = "Оператор" if row.get("role") == "user" else "Я"
-        line = (f"[{when}] {who}: {_clip(content, OLD_QUOTE_CLIP)}" if when
-                else f"{who}: {_clip(content, OLD_QUOTE_CLIP)}")
-        if spent + len(line) > budget:
-            break
-        lines.append(line)
-        spent += len(line)
-    if not lines:
+    chosen = choose_within_budget(select_quotes(rows), _quote_line, budget)
+    if not chosen:
         return ""
-    return "# Из давнего разговора, по смыслу вопроса\n" + "\n".join(lines)
+    return "# Из давнего разговора, по смыслу вопроса\n" + "\n".join(line for _, line in chosen)
 
 
 def _prepend_to_question(message: dict, block: str) -> dict:
@@ -359,6 +465,7 @@ def assemble_with_anchor(
     total_budget: int = TOTAL_BUDGET,
     anchor: int | None = None,
     age_tools: bool = True,
+    lessons: str = "",
 ) -> tuple[list[dict], int | None, int]:
     """Собрать запрос заново и вернуть его, отпечаток начала хвоста и число состаренных результатов.
 
@@ -367,7 +474,7 @@ def assemble_with_anchor(
     хода, чтобы не вставлять системные сообщения в середину разговора. Начало хвоста
     запоминается между запросами (см. select_tail), чтобы кеш ломался редко и крупно.
     """
-    spent = len(knowledge) + len(recalled) + len(old_history)
+    spent = len(knowledge) + len(recalled) + len(old_history) + len(lessons)
     spent += sum(message_size(m) for m in system_head)
     tail_budget = max(MIN_TAIL_BUDGET, total_budget - spent)
 
@@ -378,7 +485,8 @@ def assemble_with_anchor(
     # Сначала стареем, потом режем хвост: бюджет должен считаться по тому, что реально уйдёт.
     aged, aged_count = age_tool_results(conversation) if age_tools else (conversation, 0)
     tail, new_anchor = select_tail(aged, tail_budget, anchor)
-    dynamic = "\n\n".join(block for block in (recalled, old_history) if block)
+    # Уроки — выше всего изменчивого: они про то, как делать, а цитаты — про то, что было.
+    dynamic = "\n\n".join(block for block in (lessons, recalled, old_history) if block)
     if dynamic:
         tail = _attach_to_current_question(tail, dynamic)
     assembled.extend(tail)
@@ -394,7 +502,8 @@ def assemble(
     *,
     total_budget: int = TOTAL_BUDGET,
     age_tools: bool = True,
+    lessons: str = "",
 ) -> list[dict]:
     """Собрать запрос без памяти о прошлых запросах (начало хвоста считается заново)."""
     return assemble_with_anchor(system_head, knowledge, recalled, old_history, conversation,
-                                total_budget=total_budget, age_tools=age_tools)[0]
+                                total_budget=total_budget, age_tools=age_tools, lessons=lessons)[0]

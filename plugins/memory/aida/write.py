@@ -75,6 +75,31 @@ ROLES = ("assistant", "user", "system")
 
 _SPLIT_AT = re.compile(r"(?<=[.!?…])\s+|\n+")
 
+# Операционный шум не бывает «знанием всегда». Строка с хешем коммита, номером версии или словом
+# «задеплоено» — событие: она самая свежая и самая плотная по словам, поэтому отбор по кругу
+# держал её в блоке, пока настоящие правила старели за бюджетом. Замер 17.10.2026: 54 таких
+# строки в P1, в том числе «QA v9.20.0: 217/217 полей, pageerrors=0».
+_OPERATIONAL = re.compile(
+    r"(?<![\w/])[0-9a-f]{7,40}(?![\w/])"            # хеш коммита
+    r"|(?<![\w.])v?\d+\.\d+(?:\.\d+)+(?![\w.])"     # номер версии 9.20.0
+    r"|(?<![\w.])v\d+\.\d+(?![\w.])"                 # v7.1
+    r"|верси[яиюей]+\s*v?\d+\.\d+"                   # «в версии 5.0»
+    r"|задеплое|запуше|развёрнут|развернут|deployed|pageerrors|\bQA\b",
+    re.IGNORECASE,
+)
+
+
+def is_operational(content: str) -> bool:
+    return bool(_OPERATIONAL.search(content or ""))
+
+
+def effective_priority(content: str, priority: str) -> str:
+    """P1 только для того, что верно всегда: строка про версию или коммит опускается до P2."""
+    priority = normalise_priority(priority)
+    if priority == "P1" and is_operational(content):
+        return "P2"
+    return priority
+
 
 def source_tag(session_id: str = "") -> str:
     """Provenance for ``chat_id``: this agent, and which of its sessions."""
